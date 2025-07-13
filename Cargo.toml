@@ -1,0 +1,8 @@
+[package]
+name = "srt-igt-splits"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+#rusty-tesseract = "1.1.10"
+tesseract = "0.15.2"
