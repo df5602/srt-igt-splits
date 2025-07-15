@@ -8,3 +8,7 @@
     - ./vcpkg install leptonica:x64-windows-static-md tesseract:x64-windows-static-md
     - winget install LLVM
     - it seems the "tessdata" from the regular tesseract installation is still required, and TESSDATA_PREFIX needs to be set accordingly
+
+- For opencv:
+    - vcpkg install llvm opencv4[contrib,nonfree]
+    - also make sure cmake and ninja are installed
