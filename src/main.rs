@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use opencv::core::Point_;
 use opencv::core::Rect;
 use opencv::core::Size_;
 use opencv::highgui;
@@ -98,7 +97,7 @@ impl Templates {
         }
 
         load_template!(Percent, "percent.png", 0.85, '%');
-        load_template!(Colon, "colon.png", 0.80, ':');
+        load_template!(Colon, "colon.png", 0.75, ':');
         load_template!(Zero, "zero.png", 0.85, '0');
         load_template!(One, "one.png", 0.85, '1');
         load_template!(Two, "two.png", 0.85, '2');
@@ -120,16 +119,22 @@ impl Templates {
     }
 }
 
+#[derive(Clone)]
+struct TemplateMatch {
+    x: i32,
+    y: i32,
+    bounding_box: Size_<i32>,
+    character: char,
+    confidence: f32,
+}
+
 fn find_occurances_of_template(
     image: &Mat,
-    template: &Mat,
-    threshold: f32,
-    matches: &mut Vec<Point_<i32>>,
+    template: &Template,
+    matches: &mut Vec<TemplateMatch>,
 ) -> Result<()> {
-    let template_size = template.size()?;
-
-    let result_cols = image.cols() - template_size.width + 1;
-    let result_rows = image.rows() - template_size.height + 1;
+    let result_cols = image.cols() - template.size.width + 1;
+    let result_rows = image.rows() - template.size.height + 1;
 
     let mut result = Mat::new_rows_cols_with_default(
         result_rows,
@@ -140,76 +145,101 @@ fn find_occurances_of_template(
 
     imgproc::match_template(
         &image,
-        &template,
+        &template.template,
         &mut result,
         imgproc::TM_CCOEFF_NORMED,
         &opencv::core::no_array(),
     )?;
 
-    let mut result_norm = Mat::default();
-    opencv::core::normalize(
-        &result,
-        &mut result_norm,
-        0.0,
-        255.0,
-        opencv::core::NORM_MINMAX,
-        opencv::core::CV_8UC1,
-        &opencv::core::no_array(),
-    )?;
-
-    let mut result_color = Mat::default();
-    opencv::imgproc::apply_color_map(
-        &result_norm,
-        &mut result_color,
-        opencv::imgproc::COLORMAP_JET,
-    )?;
-
-    let mut result_scaled = Mat::default();
-    opencv::imgproc::resize(
-        &result_color,
-        &mut result_scaled,
-        opencv::core::Size {
-            width: result_color.cols() * 2,
-            height: result_color.rows() * 2,
-        },
-        0.0,
-        0.0,
-        imgproc::INTER_LINEAR,
-    )?;
-
-    opencv::highgui::imshow("Match Heatmap", &result_scaled)?;
-    opencv::highgui::imshow("Image (binarized)", &image)?;
-    opencv::highgui::imshow("Template (binarized)", &template)?;
-    //highgui::wait_key(0)?;
-
-    let mut min_val = 0.0;
-    let mut max_val = 0.0;
-    let mut min_loc = opencv::core::Point::default();
-    let mut max_loc = opencv::core::Point::default();
-
-    opencv::core::min_max_loc(
-        &result,
-        Some(&mut min_val),
-        Some(&mut max_val),
-        Some(&mut min_loc),
-        Some(&mut max_loc),
-        &opencv::core::no_array(),
-    )?;
-
-    // Print max match value (best score)
-    println!("Template match max score: {:.4} at {:?}", max_val, max_loc);
-
     for y in 0..result.rows() {
         for x in 0..result.cols() {
             let val = *result.at_2d::<f32>(y, x)?;
-            if val >= threshold {
-                matches.push(opencv::core::Point::new(x, y));
-                println!("Found match with score {} at ({},{})", val, x, y);
+            if val >= template.threshold {
+                matches.push(TemplateMatch {
+                    x,
+                    y,
+                    bounding_box: template.size,
+                    character: template.character,
+                    confidence: val,
+                });
             }
         }
     }
 
     Ok(())
+}
+
+fn extract_igt(
+    image: &Mat,
+    templates: &Templates,
+    matches: &mut Vec<TemplateMatch>,
+) -> Result<String> {
+    // Use '%' as an indicator whether we are in the guidebook and terminate early if not
+    let percent = templates.get(Character::Percent).unwrap();
+    find_occurances_of_template(image, &percent, matches)?;
+
+    if matches.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Find occurances of all characters
+    for template in &templates.templates {
+        if template.character == '%' {
+            continue;
+        }
+
+        find_occurances_of_template(image, &template, matches)?;
+    }
+
+    // Sort by x-coordinate
+    matches.sort_by(|a, b| a.x.cmp(&b.x));
+
+    // Simple 1D NMS on x-axis
+    let mut filtered: Vec<TemplateMatch> = Vec::new();
+    for m in matches.drain(..) {
+        let mut replaced = false;
+        for other in &mut filtered {
+            let m_start = m.x;
+            let m_end = m.x + m.bounding_box.width;
+            let o_start = other.x;
+            let o_end = other.x + other.bounding_box.width;
+
+            let overlap = (m_end.min(o_end) - m_start.max(o_start)).max(0);
+            let min_width = m.bounding_box.width.min(other.bounding_box.width);
+
+            if overlap as f32 > 0.5 * min_width as f32 {
+                if m.confidence > other.confidence {
+                    *other = m.clone();
+                }
+                replaced = true;
+                break;
+            }
+        }
+
+        if !replaced {
+            filtered.push(m);
+        }
+    }
+
+    // Sort again to ensure left-to-right order
+    filtered.sort_by(|a, b| a.x.cmp(&b.x));
+
+    let mut result = String::new();
+    for (i, m) in filtered.iter().enumerate() {
+        if i > 0 {
+            let prev = &filtered[i - 1];
+            let gap = m.x - (prev.x + prev.bounding_box.width);
+            if gap as f32 > 20.0 {
+                result.push(' ');
+            }
+        }
+        result.push(m.character);
+    }
+
+    // Return filtered matches to caller
+    *matches = filtered;
+
+    Ok(result)
 }
 
 fn main() -> Result<()> {
@@ -269,16 +299,10 @@ fn main() -> Result<()> {
             imgproc::THRESH_OTSU,
         )?;
 
-        let template = templates.get(Character::Percent).unwrap();
-        let mut matches: Vec<Point_<i32>> = vec![];
-        find_occurances_of_template(
-            &binarized_roi,
-            &template.template,
-            template.threshold,
-            &mut matches,
-        )?;
+        let mut matches: Vec<TemplateMatch> = vec![];
+        let igt = extract_igt(&binarized_roi, &templates, &mut matches)?;
         let elapsed = now.elapsed();
-        println!("Template matching took {} ms", elapsed.as_millis());
+        println!("Found {} in {} ms", igt, elapsed.as_millis());
 
         for pt in matches {
             let top_left = opencv::core::Point::new(roi_rect.x + pt.x, roi_rect.y + pt.y);
@@ -287,8 +311,8 @@ fn main() -> Result<()> {
                 opencv::core::Rect::new(
                     top_left.x,
                     top_left.y,
-                    template.size.width,
-                    template.size.height,
+                    pt.bounding_box.width,
+                    pt.bounding_box.height,
                 ),
                 opencv::core::Scalar::new(255.0, 0.0, 255.0, 0.0),
                 2,
