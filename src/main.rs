@@ -1,13 +1,124 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
 use opencv::core::Point_;
 use opencv::core::Rect;
+use opencv::core::Size_;
 use opencv::highgui;
 use opencv::imgproc;
 use opencv::prelude::*;
 use opencv::videoio;
 
 use anyhow::Result;
+
+struct Template {
+    template: Mat,
+    size: Size_<i32>,
+    threshold: f32,
+    character: char,
+}
+
+impl Template {
+    pub fn load_from_file(path: &str, threshold: f32, character: char) -> Result<Self> {
+        let template = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_GRAYSCALE)?;
+        if template.empty() {
+            panic!("Failed to load template!");
+        }
+
+        let mut binarized_template = Mat::default();
+        opencv::imgproc::threshold(
+            &template,
+            &mut binarized_template,
+            0.0,
+            255.0,
+            imgproc::THRESH_OTSU,
+        )?;
+
+        // TODO: store in proper size
+        let mut template_scaled = Mat::default();
+        opencv::imgproc::resize(
+            &binarized_template,
+            &mut template_scaled,
+            opencv::core::Size {
+                width: (binarized_template.cols() as f32 * 0.75) as i32,
+                height: (binarized_template.rows() as f32 * 0.75) as i32,
+            },
+            0.0,
+            0.0,
+            imgproc::INTER_LINEAR,
+        )?;
+
+        let template_size = template_scaled.size()?;
+
+        Ok(Self {
+            template: template_scaled,
+            size: template_size,
+            threshold,
+            character,
+        })
+    }
+}
+
+#[derive(Hash, Eq, PartialEq)]
+enum Character {
+    Percent,
+    Colon,
+    Zero,
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight,
+    Nine,
+}
+
+struct Templates {
+    indices: HashMap<Character, usize>,
+    templates: Vec<Template>,
+}
+
+impl Templates {
+    pub fn load() -> Result<Self> {
+        let mut templates = vec![];
+        let mut indices = HashMap::new();
+
+        macro_rules! load_template {
+            ($char_enum:ident, $filename:expr, $threshold:expr, $display_char:expr) => {{
+                let template = Template::load_from_file(
+                    concat!("templates/", $filename),
+                    $threshold,
+                    $display_char,
+                )?;
+                indices.insert(Character::$char_enum, templates.len());
+                templates.push(template);
+            }};
+        }
+
+        load_template!(Percent, "percent.png", 0.85, '%');
+        load_template!(Colon, "colon.png", 0.80, ':');
+        load_template!(Zero, "zero.png", 0.85, '0');
+        load_template!(One, "one.png", 0.85, '1');
+        load_template!(Two, "two.png", 0.85, '2');
+        load_template!(Three, "three.png", 0.85, '3');
+        load_template!(Four, "four.png", 0.85, '4');
+        load_template!(Five, "five.png", 0.85, '5');
+        load_template!(Six, "six.png", 0.85, '6');
+        load_template!(Seven, "seven.png", 0.90, '7');
+        load_template!(Eight, "eight.png", 0.85, '8');
+        load_template!(Nine, "nine.png", 0.85, '9');
+
+        Ok(Self { indices, templates })
+    }
+
+    pub fn get(&self, character: Character) -> Option<&Template> {
+        self.indices
+            .get(&character)
+            .map(|&idx| &self.templates[idx])
+    }
+}
 
 fn find_occurances_of_template(
     image: &Mat,
@@ -104,7 +215,7 @@ fn find_occurances_of_template(
 fn main() -> Result<()> {
     //let mut video = videoio::VideoCapture::new(2, videoio::CAP_ANY)?;
     let mut video =
-        videoio::VideoCapture::from_file_def("C:\\Users\\xxx\\Videos\\2025-07-16 20-00-51.mkv")?;
+        videoio::VideoCapture::from_file_def("C:\\Users\\domin\\Videos\\2025-07-16 20-00-51.mkv")?;
     if !videoio::VideoCapture::is_opened(&video)? {
         panic!("Unable to open video!");
     }
@@ -123,62 +234,8 @@ fn main() -> Result<()> {
     // Define the region of interest (ROI)
     let roi_rect = Rect::new(1260, 45, 620, 50); // x, y, width, height
 
-    // Load template image
-    // ==== EXPERIMENT ====
-    let template =
-        opencv::imgcodecs::imread("templates/nine.png", opencv::imgcodecs::IMREAD_GRAYSCALE)?;
-    if template.empty() {
-        panic!("Failed to load template!");
-    }
-
-    let mut binarized_template = Mat::default();
-    opencv::imgproc::threshold(
-        &template,
-        &mut binarized_template,
-        0.0,
-        255.0,
-        imgproc::THRESH_OTSU,
-    )?;
-
-    // TODO: calculate proper scaling factor (ration between 1080p and screen res) or ideally store scaled properly
-    let mut template_scaled = Mat::default();
-    opencv::imgproc::resize(
-        &binarized_template,
-        &mut template_scaled,
-        opencv::core::Size {
-            width: (binarized_template.cols() as f32 * 0.75) as i32,
-            height: (binarized_template.rows() as f32 * 0.75) as i32,
-        },
-        0.0,
-        0.0,
-        imgproc::INTER_LINEAR,
-    )?;
-
-    let template_size = template_scaled.size()?;
-    println!(
-        "Template size: {} x {}",
-        template_size.width, template_size.height
-    );
-
-    /*let _ = highgui::resize_window("Webcam OCR", template.cols(), template.rows())?;
-    highgui::imshow("Webcam OCR", &template)?;
-    highgui::wait_key(0)?;*/
-
-    let threshold = 0.85f32;
-
-    // Colon: colon.png, thr: 0.80
-    // Percent: percent.png, thr: 0.85
-    // Zero: zero.png, thr: 0.85
-    // One: one.png, thr: 0.85
-    // Two: two.png, thr: 0.85
-    // Three: three.png, thr: 0.85
-    // Four: four.png, thr: 0.85
-    // Five: five.png, thr: 0.85
-    // Six: six.png, thr: 0.85
-    // Seven: seven.png, thr: 0.9
-    // Eight: eight.png, thr: 0.85
-    // Nine: nine.png, thr: 0.85
-    // ==== END EXPERIMENT ====
+    // Load template images
+    let templates = Templates::load()?;
 
     let mut resized = false;
     loop {
@@ -212,8 +269,14 @@ fn main() -> Result<()> {
             imgproc::THRESH_OTSU,
         )?;
 
+        let template = templates.get(Character::Percent).unwrap();
         let mut matches: Vec<Point_<i32>> = vec![];
-        find_occurances_of_template(&binarized_roi, &template_scaled, threshold, &mut matches)?;
+        find_occurances_of_template(
+            &binarized_roi,
+            &template.template,
+            template.threshold,
+            &mut matches,
+        )?;
         let elapsed = now.elapsed();
         println!("Template matching took {} ms", elapsed.as_millis());
 
@@ -224,8 +287,8 @@ fn main() -> Result<()> {
                 opencv::core::Rect::new(
                     top_left.x,
                     top_left.y,
-                    template_size.width,
-                    template_size.height,
+                    template.size.width,
+                    template.size.height,
                 ),
                 opencv::core::Scalar::new(255.0, 0.0, 255.0, 0.0),
                 2,
