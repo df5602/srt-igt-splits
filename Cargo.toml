@@ -7,3 +7,4 @@ edition = "2024"
 tesseract = "0.15.2"
 opencv = { version = "0.95.0", features = ["clang-runtime"] }
 anyhow = "1.0"
+colored = "3.0"
