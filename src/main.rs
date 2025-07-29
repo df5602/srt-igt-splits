@@ -83,14 +83,37 @@ pub struct Splits {
 impl Splits {
     /// Constructs `Splits` with some placeholder test data.
     pub fn new() -> Self {
-        let splits = vec![Split {
-            percent: 117,
-            name: "Super Bonus Round".to_string(),
-            time: InGameTime {
-                percent: 117,
-                duration: Duration::from_secs(3 * 60 * 60 + 3 * 60 + 5),
-            },
-        }];
+        macro_rules! splits {
+            ( $( ($percent:expr, $name:expr, $h:expr, $m:expr, $s:expr) ),* $(,)? ) => {
+                vec![
+                    $(
+                        Split {
+                            percent: $percent,
+                            name: $name.to_string(),
+                            time: InGameTime {
+                                percent: $percent,
+                                duration: std::time::Duration::from_secs($h * 3600 + $m * 60 + $s),
+                            },
+                        }
+                    ),*
+                ]
+            };
+        }
+
+        let splits = splits![
+            (18, "Buzz", 0, 25, 43),
+            (21, "Crawdad Farm", 0, 28, 15),
+            (35, "Enchanted Towers", 0, 55, 46),
+            (56, "Fireworks Factory 1", 1, 37, 48),
+            (59, "Scorch", 1, 39, 15),
+            (67, "Spider Town", 1, 53, 53),
+            (70, "Starfish Reef", 1, 57, 23),
+            (84, "Agent 9's Lab", 2, 15, 55),
+            (85, "Cloud Spires 2", 2, 17, 37),
+            // Skipped both 87% entries as requested
+            (88, "Fireworks Factory 2", 2, 30, 18),
+            (117, "Super Bonus Round", 3, 2, 25)
+        ];
 
         Splits { splits }
     }
@@ -122,7 +145,7 @@ impl Splits {
             };
 
             let current_str = Self::format_time(current.duration);
-            println!("{}\t\t{}\t{}", split.name, colored_delta, current_str);
+            println!("{:<22} {:>8} {:>8}", split.name, colored_delta, current_str);
         }
     }
 
@@ -226,10 +249,10 @@ impl Templates {
         load_template!(Zero, "zero.png", 0.80, '0');
         load_template!(One, "one.png", 0.83, '1');
         load_template!(Two, "two.png", 0.83, '2');
-        load_template!(Three, "three.png", 0.85, '3');
+        load_template!(Three, "three.png", 0.83, '3');
         load_template!(Four, "four.png", 0.85, '4');
         load_template!(Five, "five.png", 0.85, '5');
-        load_template!(Six, "six.png", 0.85, '6');
+        load_template!(Six, "six.png", 0.83, '6');
         load_template!(Seven, "seven.png", 0.85, '7');
         load_template!(Eight, "eight.png", 0.80, '8');
         load_template!(Nine, "nine.png", 0.80, '9');
@@ -375,9 +398,9 @@ fn extract_igt(
 fn main() -> Result<()> {
     let debug = false;
 
-    //let mut video = videoio::VideoCapture::new(2, videoio::CAP_ANY)?;
-    let mut video =
-        videoio::VideoCapture::from_file_def("C:\\Users\\domin\\Videos\\2025-07-16 20-00-51.mkv")?;
+    let mut video = videoio::VideoCapture::new(2, videoio::CAP_ANY)?;
+    /*let mut video =
+    videoio::VideoCapture::from_file_def("C:\\Users\\domin\\Videos\\2025-07-16 20-00-51.mkv")?;*/
     if !videoio::VideoCapture::is_opened(&video)? {
         panic!("Unable to open video!");
     }
