@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use colored::Colorize;
 
@@ -12,51 +15,28 @@ pub struct Split {
 
 #[derive(Debug)]
 pub struct Splits {
+    pub path: Option<PathBuf>,
     pub splits: Vec<Split>,
 }
 
 impl Splits {
     /// Constructs `Splits` with some placeholder test data.
     pub fn new() -> Self {
-        Splits { splits: Vec::new() }
+        Splits {
+            path: None,
+            splits: Vec::new(),
+        }
+    }
+
+    /// Loads splits from a file
+    pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
+        crate::splits::file_persistency::load_from_file(path)
     }
 
     pub fn add_split(&mut self, name: String, time: InGameTime) {
         self.splits.push(Split { name, time });
         self.splits
             .sort_by(|a, b| a.time.percent.cmp(&b.time.percent));
-    }
-
-    // Temporary prototype code, to be removed (load from file)
-    pub fn create_from_current_pb() -> Self {
-        let mut splits = Splits::new();
-        macro_rules! splits {
-            ( $( ($percent:expr, $name:expr, $h:expr, $m:expr, $s:expr) ),* $(,)? ) => {
-                    $(
-                        splits.add_split($name.to_string(),
-                            InGameTime {
-                                percent: $percent,
-                                duration: std::time::Duration::from_secs($h * 3600 + $m * 60 + $s),
-                            });
-                    )*
-            };
-        }
-
-        splits![
-            (18, "Buzz", 0, 25, 43),
-            (21, "Crawdad Farm", 0, 28, 15),
-            (35, "Enchanted Towers", 0, 55, 46),
-            (56, "Fireworks Factory 1", 1, 37, 48),
-            (59, "Scorch", 1, 39, 15),
-            (67, "Spider Town", 1, 53, 53),
-            (70, "Starfish Reef", 1, 57, 23),
-            (84, "Agent 9's Lab", 2, 15, 55),
-            (85, "Cloud Spires 2", 2, 17, 37),
-            (88, "Fireworks Factory 2", 2, 30, 18),
-            (117, "Super Bonus Round", 3, 2, 25)
-        ];
-
-        splits
     }
 
     /// Returns the split matching the given percent, if found.

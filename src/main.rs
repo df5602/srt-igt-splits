@@ -5,6 +5,7 @@ use in_game_time::InGameTime;
 use splits::Splits;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use opencv::core::Rect;
 use opencv::core::Size_;
@@ -14,6 +15,7 @@ use opencv::prelude::*;
 use opencv::videoio;
 
 use anyhow::{Result, anyhow};
+use clap::Parser;
 
 struct Template {
     template: Mat,
@@ -252,7 +254,16 @@ fn extract_igt(
     Ok(InGameTime::parse(&result)?)
 }
 
+#[derive(Parser, Debug)]
+pub struct Args {
+    /// Path to the splits JSON file
+    #[arg(value_name = "SPLITS_FILE")]
+    pub splits_file: PathBuf,
+}
+
 fn main() -> Result<()> {
+    let args = Args::parse();
+
     let debug = false;
 
     let mut video = videoio::VideoCapture::new(2, videoio::CAP_ANY)?;
@@ -281,7 +292,7 @@ fn main() -> Result<()> {
     // Load template images
     let templates = Templates::load()?;
 
-    let splits = Splits::create_from_current_pb();
+    let splits = Splits::load_from_file(&args.splits_file)?;
 
     let mut resized = false;
     let mut last_igt = InGameTime::default();
