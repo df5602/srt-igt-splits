@@ -281,7 +281,7 @@ fn main() -> Result<()> {
     // Load template images
     let templates = Templates::load()?;
 
-    let splits = Splits::new();
+    let splits = Splits::create_from_current_pb();
 
     let mut resized = false;
     let mut last_igt = InGameTime::default();
