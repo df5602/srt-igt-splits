@@ -4,6 +4,8 @@ use std::{
 };
 
 use colored::Colorize;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::in_game_time::InGameTime;
 
@@ -55,6 +57,8 @@ impl Splits {
 
     pub fn compare_and_print(&self, current: &InGameTime) {
         if let Some((delta, split)) = self.compare(current) {
+            let name_width = self.compute_name_width();
+            let display_name = Self::truncate_name(&split.name, name_width);
             let colored_delta = if delta >= 0 {
                 let delta_str = format!("+{:02}:{:02}", delta / 60, delta % 60);
                 delta_str.red()
@@ -64,7 +68,75 @@ impl Splits {
             };
 
             let current_str = Self::format_time(current.duration);
-            println!("{:<22} {:>8} {:>8}", split.name, colored_delta, current_str);
+            println!(
+                "{} {:>8} {:>8}",
+                Self::pad_str(&display_name, name_width),
+                colored_delta,
+                current_str
+            );
+        }
+    }
+
+    /// Prints all the splits in order, without time comparison.
+    pub fn print_splits(&self) {
+        let name_width = self.compute_name_width();
+
+        for split in &self.splits {
+            let display_name = Self::truncate_name(&split.name, name_width);
+            let duration_str = Self::format_time(split.time.duration);
+            println!(
+                "{} {:>8} {:>8}",
+                Self::pad_str(&display_name, name_width),
+                " ",
+                duration_str
+            );
+        }
+    }
+
+    fn compute_name_width(&self) -> usize {
+        const MAX_NAME_WIDTH: usize = 25;
+
+        self.splits
+            .iter()
+            .map(|s| s.name.len())
+            .max()
+            .map(|len| len.min(MAX_NAME_WIDTH))
+            .unwrap_or(0)
+    }
+
+    /// Truncates a string to a max display width. If truncation is needed, adds "..".
+    fn truncate_name(name: &str, max_display_width: usize) -> String {
+        if UnicodeWidthStr::width(name) <= max_display_width {
+            return name.to_string();
+        }
+
+        let mut result = String::new();
+        let mut width = 0;
+
+        for g in UnicodeSegmentation::graphemes(name, true) {
+            let g_width = UnicodeWidthStr::width(g);
+            if width + g_width > max_display_width - 2 {
+                break;
+            }
+            result.push_str(g);
+            width += g_width;
+        }
+
+        if width < UnicodeWidthStr::width(name) {
+            result.push_str("..");
+        }
+
+        result
+    }
+
+    /// Pads a string on the right with spaces to match the target display width.
+    fn pad_str(s: &str, target_width: usize) -> String {
+        let width = UnicodeWidthStr::width(s);
+        if width >= target_width {
+            s.to_string()
+        } else {
+            let pad = " ".repeat(target_width - width);
+            format!("{}{}", s, pad)
         }
     }
 
