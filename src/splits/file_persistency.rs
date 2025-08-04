@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
+use tempfile::NamedTempFile;
 
 use crate::in_game_time::InGameTime;
 use crate::splits::{Splits, splits::Split};
@@ -90,6 +92,25 @@ pub(crate) struct SplitV1 {
     pub duration: HmsDuration,
 }
 
+impl From<&Splits> for SplitsFileV1 {
+    fn from(splits: &Splits) -> Self {
+        SplitsFileV1 {
+            version: SPLITS_FILE_VERSION,
+            splits: SplitsV1 {
+                splits: splits
+                    .splits
+                    .iter()
+                    .map(|s| SplitV1 {
+                        name: s.name.clone(),
+                        percent: s.time.percent,
+                        duration: HmsDuration(s.time.duration),
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
 fn from_v1(file_v1: SplitsFileV1, path: &Path) -> Splits {
     let splits = file_v1
         .splits
@@ -125,8 +146,33 @@ pub fn load_from_file(path: &Path) -> Result<Splits> {
     }
 }
 
+pub fn save_to_file(splits: &Splits, path: &Path) -> Result<()> {
+    // Convert Splits → SplitsFileV1
+    let file_v1 = SplitsFileV1::from(splits);
+
+    // Serialize to pretty JSON
+    let json = serde_json::to_string_pretty(&file_v1)?;
+
+    // Create temp file in same directory
+    let mut temp_file = NamedTempFile::new_in(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid path: no parent directory"))?,
+    )?;
+
+    // Write JSON
+    temp_file.write_all(json.as_bytes())?;
+    temp_file.flush()?;
+
+    // Persist atomically
+    temp_file.persist(path)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -303,6 +349,82 @@ mod tests {
             Duration::from_secs(1 * 3600)
         );
         assert_eq!(splits.path.as_ref(), Some(&file_path));
+
+        Ok(())
+    }
+
+    #[test]
+    fn save_to_file_writes_valid_v1_splits() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("splits.json");
+
+        let mut splits = Splits::new();
+        splits.add_split(
+            "Start".to_string(),
+            InGameTime {
+                percent: 25,
+                duration: Duration::from_secs(5),
+            },
+        );
+        splits.add_split(
+            "End".to_string(),
+            InGameTime {
+                percent: 100,
+                duration: Duration::from_secs(5 * 60),
+            },
+        );
+        splits.path = Some(file_path.clone());
+
+        splits.save_to_file()?;
+
+        // Check that file exists and contains expected JSON
+        let contents = fs::read_to_string(&file_path)?;
+        assert!(contents.contains("\"version\": 1"));
+        assert!(contents.contains("\"Start\""));
+        assert!(contents.contains("\"End\""));
+
+        Ok(())
+    }
+
+    #[test]
+    fn save_then_load_round_trip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("roundtrip_splits.json");
+
+        let mut original_splits = Splits::new();
+        original_splits.add_split(
+            "Split 1".to_string(),
+            InGameTime {
+                percent: 25,
+                duration: Duration::from_secs(600),
+            },
+        );
+        original_splits.add_split(
+            "Split 2".to_string(),
+            InGameTime {
+                percent: 75,
+                duration: Duration::from_secs(1800),
+            },
+        );
+        original_splits.path = Some(file_path.clone());
+
+        // Save to file
+        original_splits.save_to_file()?;
+
+        // Load from file
+        let loaded_splits = load_from_file(&file_path)?;
+
+        // Assert they match (except path which is set during load)
+        assert_eq!(loaded_splits.splits.len(), original_splits.splits.len());
+        for (orig, loaded) in original_splits
+            .splits
+            .iter()
+            .zip(loaded_splits.splits.iter())
+        {
+            assert_eq!(orig.name, loaded.name);
+            assert_eq!(orig.time.percent, loaded.time.percent);
+            assert_eq!(orig.time.duration, loaded.time.duration);
+        }
 
         Ok(())
     }

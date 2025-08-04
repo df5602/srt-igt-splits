@@ -35,6 +35,16 @@ impl Splits {
         crate::splits::file_persistency::load_from_file(path)
     }
 
+    /// Save splits to file
+    pub fn save_to_file(&self) -> anyhow::Result<()> {
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No file path to save to"))?;
+
+        crate::splits::file_persistency::save_to_file(self, path)
+    }
+
     pub fn add_split(&mut self, name: String, time: InGameTime) {
         self.splits.push(Split { name, time });
         self.splits
