@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::{fmt, time::Duration};
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
 pub struct InGameTime {
     pub percent: u32,
     pub duration: Duration,
