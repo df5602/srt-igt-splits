@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::in_game_time::InGameTime;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveRun {
     pub id: Uuid,
     pub start_time: DateTime<Utc>,
@@ -19,7 +19,7 @@ pub struct ActiveRun {
     pub latest_split: InGameTime,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunSummary {
     pub id: Uuid,
     pub start_time: DateTime<Utc>,
@@ -33,7 +33,7 @@ pub struct HistoricalSplit {
     pub duration: Duration,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Split {
     pub name: String,
     pub percent: u32,
@@ -41,7 +41,7 @@ pub struct Split {
     pub history: Vec<HistoricalSplit>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Splits {
     path: Option<PathBuf>,
     active_run: Option<ActiveRun>,
@@ -62,6 +62,7 @@ impl Splits {
         }
     }
 
+    /// Currently only used for tests and deserialization
     pub fn create(path: PathBuf, mut splits: Vec<Split>) -> Self {
         splits.sort_by(|a, b| a.percent.cmp(&b.percent));
         Splits {
@@ -73,12 +74,33 @@ impl Splits {
         }
     }
 
+    /// Currently only used for tests and deserialization
+    pub fn create_with_history(
+        path: PathBuf,
+        personal_best: Option<RunSummary>,
+        runs: Vec<RunSummary>,
+        mut splits: Vec<Split>,
+    ) -> Self {
+        splits.sort_by(|a, b| a.percent.cmp(&b.percent));
+        Splits {
+            path: Some(path),
+            active_run: None,
+            personal_best,
+            runs,
+            splits,
+        }
+    }
+
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
     }
 
     pub fn active_run(&self) -> Option<&ActiveRun> {
         self.active_run.as_ref()
+    }
+
+    pub fn personal_best(&self) -> Option<&RunSummary> {
+        self.personal_best.as_ref()
     }
 
     pub fn runs(&self) -> &Vec<RunSummary> {
