@@ -99,6 +99,18 @@ impl Splits {
         self.active_run.as_ref()
     }
 
+    // This is a hack, might be one more argument for proper LiveSplit integration
+    pub fn initialize_active_run(&mut self, time: &InGameTime) {
+        if self.active_run.is_none() {
+            self.active_run = Some(ActiveRun {
+                id: Uuid::new_v4(),
+                start_time: Utc::now(),
+                end_time: Some(Utc::now()),
+                latest_split: *time,
+            });
+        }
+    }
+
     pub fn personal_best(&self) -> Option<&RunSummary> {
         self.personal_best.as_ref()
     }
@@ -276,6 +288,8 @@ impl Splits {
         if self.is_final_split(current) {
             self.finalize_run_at(run_id, current, now);
         }
+
+        self.save_to_file();
     }
 
     pub fn compare_and_print(&self, current: &InGameTime) {
@@ -306,18 +320,22 @@ impl Splits {
         let name_width = self.compute_name_width();
 
         for split in &self.splits {
-            let display_name = Self::truncate_name(&split.name, name_width);
-            let duration_str = Self::format_time(split.time);
-            println!(
-                "{} {:>8} {:>8}",
-                Self::pad_str(&display_name, name_width),
-                " ",
-                duration_str
-            );
+            Self::print_split(name_width, split);
         }
     }
 
-    fn compute_name_width(&self) -> usize {
+    pub fn print_split(name_width: usize, split: &Split) {
+        let display_name = Self::truncate_name(&split.name, name_width);
+        let duration_str = Self::format_time(split.time);
+        println!(
+            "{} {:>8} {:>8}",
+            Self::pad_str(&display_name, name_width),
+            " ",
+            duration_str
+        );
+    }
+
+    pub fn compute_name_width(&self) -> usize {
         const MAX_NAME_WIDTH: usize = 25;
 
         self.splits
@@ -329,7 +347,7 @@ impl Splits {
     }
 
     /// Truncates a string to a max display width. If truncation is needed, adds "..".
-    fn truncate_name(name: &str, max_display_width: usize) -> String {
+    pub fn truncate_name(name: &str, max_display_width: usize) -> String {
         if UnicodeWidthStr::width(name) <= max_display_width {
             return name.to_string();
         }
@@ -354,7 +372,7 @@ impl Splits {
     }
 
     /// Pads a string on the right with spaces to match the target display width.
-    fn pad_str(s: &str, target_width: usize) -> String {
+    pub fn pad_str(s: &str, target_width: usize) -> String {
         let width = UnicodeWidthStr::width(s);
         if width >= target_width {
             s.to_string()
@@ -364,7 +382,7 @@ impl Splits {
         }
     }
 
-    fn format_time(duration: Option<Duration>) -> String {
+    pub fn format_time(duration: Option<Duration>) -> String {
         match duration {
             Some(duration) => {
                 let secs = duration.as_secs();

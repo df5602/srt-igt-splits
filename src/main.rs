@@ -2,7 +2,7 @@ mod in_game_time;
 mod splits;
 
 use in_game_time::InGameTime;
-use splits::Splits;
+use splits::{Splits, SplitsDisplay};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -292,10 +292,13 @@ fn main() -> Result<()> {
     // Load template images
     let templates = Templates::load()?;
 
-    let splits = Splits::load_from_file(&args.splits_file)?;
+    let mut splits = Splits::load_from_file(&args.splits_file)?;
+    let mut display = SplitsDisplay::new();
+    //splits.print_splits();
 
     let mut resized = false;
     let mut last_igt = InGameTime::default();
+    let mut run_finished = false;
 
     println!();
     println!();
@@ -337,8 +340,46 @@ fn main() -> Result<()> {
             //println!("Found <{}> in {} ms", igt, elapsed.as_millis());
 
             if igt != last_igt {
-                //println!("IGT: {}", igt);
-                splits.compare_and_print(&igt);
+                if debug {
+                    println!("IGT: {}", igt);
+                }
+
+                if splits.active_run().is_none() {
+                    println!("IGT:");
+                    for split in splits.splits().iter().take(3) {
+                        Splits::print_split(splits.compute_name_width(), split);
+                    }
+
+                    // FIXME: this doesn't work if the IGT/percentage is <= first split
+                    // Not sure whether there's a solution without integrating with LiveSplit / providing explicit GUI controls
+                    splits.initialize_active_run(&igt);
+                    run_finished = true;
+                }
+
+                splits.update_with_igt(&igt);
+
+                if let Some(active_run) = splits.active_run()
+                    && active_run.end_time.is_none()
+                {
+                    run_finished = false;
+                }
+
+                if !run_finished {
+                    let lines = display.render_split_view(&splits, &igt, 3);
+                    if !lines.is_empty() {
+                        println!("IGT:");
+                        for line in lines {
+                            println!("{}", line);
+                        }
+                    }
+                }
+
+                if let Some(active_run) = splits.active_run()
+                    && active_run.end_time.is_some()
+                {
+                    run_finished = true;
+                }
+
                 last_igt = igt;
             }
         }
