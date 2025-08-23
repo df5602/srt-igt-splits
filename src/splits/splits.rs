@@ -1,8 +1,10 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use anyhow::bail;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use unicode_segmentation::UnicodeSegmentation;
@@ -63,15 +65,16 @@ impl Splits {
     }
 
     /// Currently only used for tests and deserialization
-    pub fn create(path: PathBuf, mut splits: Vec<Split>) -> Self {
-        splits.sort_by(|a, b| a.percent.cmp(&b.percent));
-        Splits {
+    pub fn create(path: PathBuf, splits: Vec<Split>) -> anyhow::Result<Self> {
+        let mut splits = Splits {
             path: Some(path),
             active_run: None,
             personal_best: None,
             runs: Vec::new(),
             splits,
-        }
+        };
+        splits.validate()?;
+        Ok(splits)
     }
 
     /// Currently only used for tests and deserialization
@@ -79,16 +82,17 @@ impl Splits {
         path: PathBuf,
         personal_best: Option<RunSummary>,
         runs: Vec<RunSummary>,
-        mut splits: Vec<Split>,
-    ) -> Self {
-        splits.sort_by(|a, b| a.percent.cmp(&b.percent));
-        Splits {
+        splits: Vec<Split>,
+    ) -> anyhow::Result<Self> {
+        let mut splits = Splits {
             path: Some(path),
             active_run: None,
             personal_best,
             runs,
             splits,
-        }
+        };
+        splits.validate()?;
+        Ok(splits)
     }
 
     pub fn path(&self) -> Option<&PathBuf> {
@@ -125,7 +129,9 @@ impl Splits {
 
     /// Loads splits from a file
     pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
-        crate::splits::file_persistency::load_from_file(path)
+        let mut splits = crate::splits::file_persistency::load_from_file(path)?;
+        splits.validate()?;
+        Ok(splits)
     }
 
     /// Save splits to file
@@ -138,14 +144,93 @@ impl Splits {
         crate::splits::file_persistency::save_to_file(self, path)
     }
 
-    fn add_split(&mut self, name: String, time: InGameTime) {
-        self.splits.push(Split {
-            name,
-            percent: time.percent,
-            time: Some(time.duration),
-            history: Vec::new(),
-        });
+    fn validate(&mut self) -> anyhow::Result<()> {
+        // Splits must be sorted by percent
         self.splits.sort_by(|a, b| a.percent.cmp(&b.percent));
+
+        // Splits can't contain duplicate entries
+        // We just sorted above, so we can rely on that.
+        if self.splits.windows(2).any(|s| s[0].percent == s[1].percent) {
+            bail!("Splits contain duplicate entries (percentages)");
+        }
+
+        // Runs should be sorted according to start time
+        self.runs.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+
+        // Runs can't have duplicate IDs (also build a map from run ID -> sort order for later)
+        let mut run_indices: HashMap<Uuid, usize> = HashMap::new();
+        for (idx, run) in self.runs().iter().enumerate() {
+            if !run_indices.insert(run.id, idx).is_none() {
+                bail!("Runs have duplicate IDs");
+            }
+        }
+
+        // If `personal_best` is set, it should reference a run in `runs`.
+        // Add if missing
+        if let Some(pb) = self.personal_best() {
+            if self.runs().iter().find(|&run| run.id == pb.id).is_none() {
+                self.runs.push(pb.clone());
+            }
+        }
+
+        // Splits history should be sorted according to run order
+        // Splits history should not contain duplicates, take "last one" (largest duration)
+        for split in &mut self.splits {
+            split.history.sort_by(|a, b| {
+                let idxa = run_indices.get(&a.run_id);
+                let idxb = run_indices.get(&b.run_id);
+                match idxa.cmp(&idxb) {
+                    ord @ std::cmp::Ordering::Less | ord @ std::cmp::Ordering::Greater => ord,
+                    std::cmp::Ordering::Equal => {
+                        // Reverse comparison so that larger duration comes first (and is kept during the dedup() step)
+                        b.duration.cmp(&a.duration)
+                    }
+                }
+            });
+            split.history.dedup_by_key(|hs| hs.run_id);
+        }
+
+        // Final split should match final time in run summary (if present)
+        if let Some(final_split) = self.splits.last_mut() {
+            for run in &self.runs {
+                if let Some(final_time) = run.final_time {
+                    match final_split
+                        .history
+                        .iter_mut()
+                        .find(|hs| hs.run_id == run.id)
+                    {
+                        Some(hs) => hs.duration = final_time,
+                        None => final_split.history.push(HistoricalSplit {
+                            run_id: run.id,
+                            duration: final_time,
+                        }),
+                    }
+                }
+            }
+
+            // re-sort
+            final_split.history.sort_by(|a, b| {
+                let idxa = run_indices.get(&a.run_id);
+                let idxb = run_indices.get(&b.run_id);
+                idxa.cmp(&idxb)
+            });
+        }
+
+        // PB times should match personal best
+        for split in &mut self.splits {
+            match &self.personal_best {
+                Some(pb) => {
+                    split.time = split
+                        .history
+                        .iter()
+                        .find(|&hs| hs.run_id == pb.id)
+                        .map(|hs| hs.duration)
+                }
+                None => split.time = None,
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the split matching the given percent, if found.
@@ -225,13 +310,10 @@ impl Splits {
 
     fn record_split_time(&mut self, run_id: Uuid, current: &InGameTime) {
         if let Some(current_split) = self.find_by_percent_mut(current) {
-            // If this every becomes a performance issue (although I don't think we'll ever have enough runs in a splits file that O(n)
-            // becomes an issue here), we would need to enforce the invariant "historical splits are sorted by run order" and validate
-            // during load from file.
             let existing = current_split
                 .history
-                .iter_mut()
-                .find(|entry| entry.run_id == run_id);
+                .last_mut()
+                .filter(|hs| hs.run_id == run_id);
 
             match existing {
                 Some(entry) => entry.duration = current.duration,
@@ -417,21 +499,483 @@ mod tests {
     }
 
     #[test]
-    fn add_split_sorts_by_percent() {
-        let mut splits = Splits::new();
-        splits.add_split("Second".into(), make_ingame_time(50, 0, 10, 0));
-        splits.add_split("First".into(), make_ingame_time(25, 0, 5, 0));
-        splits.add_split("Third".into(), make_ingame_time(75, 0, 15, 0));
+    fn validate_splits_are_sorted_by_percentage() {
+        let split1 = Split {
+            name: "C".to_string(),
+            percent: 75,
+            time: None,
+            history: vec![],
+        };
+        let split2 = Split {
+            name: "A".to_string(),
+            percent: 25,
+            time: None,
+            history: vec![],
+        };
+        let split3 = Split {
+            name: "B".to_string(),
+            percent: 50,
+            time: None,
+            history: vec![],
+        };
 
-        let names: Vec<_> = splits.splits.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["First", "Second", "Third"]);
+        let splits = Splits::create(PathBuf::from("dummy_path"), vec![split1, split2, split3])
+            .expect("splits should be valid");
+
+        let percents: Vec<u32> = splits.splits.iter().map(|s| s.percent).collect();
+
+        assert_eq!(percents, vec![25, 50, 75]);
+    }
+
+    #[test]
+    fn validate_fails_on_duplicate_percents() {
+        let path = PathBuf::from("dummy_path");
+
+        // Two splits with the same percent (50)
+        let splits = vec![
+            Split {
+                name: "First".to_string(),
+                percent: 50,
+                time: None,
+                history: Vec::new(),
+            },
+            Split {
+                name: "Second".to_string(),
+                percent: 50,
+                time: None,
+                history: Vec::new(),
+            },
+        ];
+
+        let result = Splits::create(path, splits);
+        assert!(
+            result.is_err(),
+            "Expected create() to fail due to duplicate percents"
+        );
+    }
+
+    #[test]
+    fn validate_fails_on_duplicate_run_ids() {
+        use uuid::Uuid;
+
+        let duplicate_id = Uuid::new_v4();
+
+        let runs = vec![
+            RunSummary {
+                id: duplicate_id,
+                start_time: Utc::now() - Duration::from_secs(60 * 60),
+                end_time: None,
+                final_time: None,
+            },
+            RunSummary {
+                id: duplicate_id, // duplicate
+                start_time: Utc::now(),
+                end_time: None,
+                final_time: None,
+            },
+        ];
+
+        let result =
+            Splits::create_with_history(PathBuf::from("dummy_path"), None, runs, Vec::new());
+        assert!(
+            result.is_err(),
+            "Expected create() to fail due to duplicate run IDs"
+        );
+    }
+
+    #[test]
+    fn validate_adds_missing_personal_best_run() {
+        let pb_run = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(60 * 60),
+            end_time: Some(Utc::now()),
+            final_time: Some(Duration::from_secs(45 * 60 + 15)),
+        };
+
+        // `runs` does not contain the PB run yet
+        let runs = vec![];
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            Some(pb_run.clone()), // PB is set
+            runs,
+            Vec::new(),
+        )
+        .expect("create() should succeed by fixing up missing PB run");
+
+        // The PB run must now exist in runs
+        let found = splits
+            .runs()
+            .iter()
+            .find(|r| r.id == pb_run.id)
+            .expect("Expected PB run to be added");
+
+        // It should be exactly the same as the PB run
+        assert_eq!(
+            found, &pb_run,
+            "PB run in runs must match personal_best exactly"
+        );
+    }
+
+    #[test]
+    fn validate_sorts_history_entries_by_run_order() {
+        use uuid::Uuid;
+
+        let run_a = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(300),
+            end_time: Some(Utc::now() - Duration::from_secs(200)),
+            final_time: Some(Duration::from_secs(105)),
+        };
+        let run_b = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(200),
+            end_time: Some(Utc::now() - Duration::from_secs(100)),
+            final_time: Some(Duration::from_secs(100)),
+        };
+        let run_c = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(100),
+            end_time: Some(Utc::now()),
+            final_time: Some(Duration::from_secs(95)),
+        };
+
+        let runs = vec![run_a.clone(), run_b.clone(), run_c.clone()];
+
+        // History deliberately out of order
+        let split = Split {
+            name: "Split".to_string(),
+            percent: 50,
+            time: None,
+            history: vec![
+                HistoricalSplit {
+                    run_id: run_c.id,
+                    duration: Duration::from_secs(95),
+                },
+                HistoricalSplit {
+                    run_id: run_a.id,
+                    duration: Duration::from_secs(105),
+                },
+                HistoricalSplit {
+                    run_id: run_b.id,
+                    duration: Duration::from_secs(100),
+                },
+            ],
+        };
+
+        let splits =
+            Splits::create_with_history(PathBuf::from("dummy_path"), None, runs, vec![split])
+                .expect("create() should succeed");
+
+        let sorted_history_ids: Vec<Uuid> =
+            splits.splits[0].history.iter().map(|h| h.run_id).collect();
+
+        assert_eq!(
+            sorted_history_ids,
+            vec![run_a.id, run_b.id, run_c.id],
+            "History entries must be sorted according to run order"
+        );
+    }
+
+    #[test]
+    fn validate_deduplicates_history_last_one_wins() {
+        let run = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(100),
+            end_time: Some(Utc::now()),
+            final_time: Some(Duration::from_secs(100)),
+        };
+
+        // Split with multiple entries for the same run
+        let splits = vec![
+            Split {
+                name: "First Split".to_string(),
+                percent: 50,
+                time: None,
+                history: vec![
+                    HistoricalSplit {
+                        run_id: run.id,
+                        duration: Duration::from_secs(10),
+                    },
+                    HistoricalSplit {
+                        run_id: run.id,
+                        duration: Duration::from_secs(20),
+                    },
+                    HistoricalSplit {
+                        run_id: run.id,
+                        duration: Duration::from_secs(15),
+                    },
+                ],
+            },
+            Split {
+                name: "Final Split".to_string(),
+                percent: 100,
+                time: None,
+                history: vec![],
+            },
+        ];
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            None,
+            vec![run.clone()],
+            splits,
+        )
+        .expect("create_with_history() should succeed");
+
+        // After deduplication, only the "last one" (largest duration) should remain
+        let remaining = &splits.splits[0].history;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].run_id, run.id);
+        assert_eq!(remaining[0].duration, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn validate_final_split_only_updates_last_split() {
+        let run = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(120),
+            end_time: Some(Utc::now()),
+            final_time: Some(Duration::from_secs(120)),
+        };
+
+        // Early split that should remain untouched
+        let early_split = Split {
+            name: "Early".to_string(),
+            percent: 50,
+            time: None,
+            history: vec![HistoricalSplit {
+                run_id: run.id,
+                duration: Duration::from_secs(60),
+            }],
+        };
+
+        // Final split with a wrong duration
+        let final_split = Split {
+            name: "Final".to_string(),
+            percent: 100,
+            time: None,
+            history: vec![HistoricalSplit {
+                run_id: run.id,
+                duration: Duration::from_secs(90),
+            }],
+        };
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            None,
+            vec![run.clone()],
+            vec![early_split, final_split],
+        )
+        .expect("create_with_history() should succeed");
+
+        // Check final split is fixed
+        let last = &splits.splits[1].history.last().unwrap();
+        assert_eq!(
+            last.duration,
+            run.final_time.unwrap(),
+            "Final split duration must match run final_time"
+        );
+
+        // Check early split is untouched
+        let early = &splits.splits[0].history.last().unwrap();
+        assert_eq!(
+            early.duration,
+            Duration::from_secs(60),
+            "Early split duration should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn validate_sorts_unknown_run_ids_to_start() {
+        let known_run = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now(),
+            end_time: Some(Utc::now() + Duration::from_secs(5)),
+            final_time: Some(Duration::from_secs(5)),
+        };
+
+        // HistoricalSplit with an unknown run_id
+        let unknown_run_id = Uuid::new_v4();
+
+        let split = Split {
+            name: "Split".to_string(),
+            percent: 50,
+            time: None,
+            history: vec![
+                HistoricalSplit {
+                    run_id: known_run.id,
+                    duration: Duration::from_secs(5),
+                },
+                HistoricalSplit {
+                    run_id: unknown_run_id,
+                    duration: Duration::from_secs(99),
+                },
+            ],
+        };
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            None,
+            vec![known_run.clone()],
+            vec![split],
+        )
+        .expect("create_with_history() should succeed");
+
+        // After validate, unknown IDs should come first
+        let history = &splits.splits[0].history;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].run_id, unknown_run_id);
+        assert_eq!(history[1].run_id, known_run.id);
+    }
+
+    #[test]
+    fn validate_final_split_inserts_missing_historical_split() {
+        let run = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(60),
+            end_time: Some(Utc::now()),
+            final_time: Some(Duration::from_secs(45)),
+        };
+
+        // Final split is missing history
+        let final_split = Split {
+            name: "Final".to_string(),
+            percent: 100,
+            time: None,
+            history: vec![],
+        };
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            None,
+            vec![run.clone()],
+            vec![final_split],
+        )
+        .expect("create_with_history() should succeed");
+
+        let history = &splits.splits[0].history;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].run_id, run.id);
+        assert_eq!(history[0].duration, run.final_time.unwrap());
+    }
+
+    #[test]
+    fn validate_sorts_runs_by_start_time() {
+        let run1 = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(60),
+            end_time: None,
+            final_time: None,
+        };
+        let run2 = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now(),
+            end_time: None,
+            final_time: None,
+        };
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            None,
+            vec![run2.clone(), run1.clone()],
+            Vec::new(),
+        )
+        .expect("create_with_history() should succeed");
+
+        // Runs should be sorted by start_time ascending
+        let sorted_runs: Vec<_> = splits.runs().iter().map(|r| r.id).collect();
+        assert_eq!(sorted_runs, vec![run1.id, run2.id]);
+    }
+
+    #[test]
+    fn validate_sets_split_times_from_pb() {
+        let pb_run = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now() - Duration::from_secs(60),
+            end_time: Some(Utc::now()),
+            final_time: Some(Duration::from_secs(60)),
+        };
+
+        let split1 = Split {
+            name: "50%".into(),
+            percent: 50,
+            time: None,
+            history: vec![HistoricalSplit {
+                run_id: pb_run.id,
+                duration: Duration::from_secs(30),
+            }],
+        };
+        let split2 = Split {
+            name: "100%".into(),
+            percent: 100,
+            time: None,
+            history: vec![HistoricalSplit {
+                run_id: pb_run.id,
+                duration: Duration::from_secs(60),
+            }],
+        };
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            Some(pb_run),
+            vec![],
+            vec![split1, split2],
+        )
+        .expect("create_with_history() should succeed");
+
+        // After validate, each split.time should match PB’s duration
+        assert_eq!(splits.splits()[0].time, Some(Duration::from_secs(30)));
+        assert_eq!(splits.splits()[1].time, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn validate_sets_split_time_to_none_if_no_personal_best() {
+        let run = RunSummary {
+            id: Uuid::new_v4(),
+            start_time: Utc::now(),
+            end_time: None,
+            final_time: None,
+        };
+
+        let split = Split {
+            name: "Split 1".to_string(),
+            percent: 50,
+            time: Some(Duration::from_secs(30)),
+            history: vec![HistoricalSplit {
+                run_id: run.id,
+                duration: Duration::from_secs(30),
+            }],
+        };
+
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            None, // no personal best
+            vec![run],
+            vec![split],
+        )
+        .expect("create_with_history() should succeed");
+
+        // Assert that split.time is None because there is no PB
+        assert_eq!(splits.splits()[0].time, None);
     }
 
     #[test]
     fn find_by_percent_finds_correct_split() {
-        let mut splits = Splits::new();
-        splits.add_split("Alpha".into(), make_ingame_time(10, 0, 1, 0));
-        splits.add_split("Beta".into(), make_ingame_time(20, 0, 2, 0));
+        let split1 = Split {
+            name: "Alpha".to_string(),
+            percent: 10,
+            time: Some(Duration::from_secs(60)),
+            history: vec![],
+        };
+        let split2 = Split {
+            name: "Beta".to_string(),
+            percent: 20,
+            time: Some(Duration::from_secs(2 * 60)),
+            history: vec![],
+        };
+        let splits = Splits::create(PathBuf::from("dummy_path"), vec![split1, split2])
+            .expect("splits should be valid");
 
         let result = splits.find_by_percent(&make_ingame_time(20, 0, 0, 0));
         assert!(result.is_some());
@@ -440,8 +984,14 @@ mod tests {
 
     #[test]
     fn find_by_percent_returns_none_for_unknown_percent() {
-        let mut splits = Splits::new();
-        splits.add_split("One".into(), make_ingame_time(30, 0, 3, 0));
+        let split1 = Split {
+            name: "One".to_string(),
+            percent: 30,
+            time: Some(Duration::from_secs(3 * 60)),
+            history: vec![],
+        };
+        let splits = Splits::create(PathBuf::from("dummy_path"), vec![split1])
+            .expect("splits should be valid");
 
         let result = splits.find_by_percent(&make_ingame_time(40, 0, 0, 0));
         assert!(result.is_none());
@@ -449,9 +999,38 @@ mod tests {
 
     #[test]
     fn compare_returns_correct_positive_delta() {
-        let mut splits = Splits::new();
-        splits.add_split("One".into(), make_ingame_time(50, 0, 8, 30));
-        splits.add_split("Two".into(), make_ingame_time(60, 0, 10, 0));
+        let id = Uuid::new_v4();
+        let split1 = Split {
+            name: "One".to_string(),
+            percent: 50,
+            time: Some(Duration::from_secs(8 * 60 + 30)),
+            history: vec![HistoricalSplit {
+                run_id: id,
+                duration: Duration::from_secs(8 * 60 + 30),
+            }],
+        };
+        let split2 = Split {
+            name: "Two".to_string(),
+            percent: 60,
+            time: Some(Duration::from_secs(10 * 60)),
+            history: vec![HistoricalSplit {
+                run_id: id,
+                duration: Duration::from_secs(10 * 60),
+            }],
+        };
+        let personal_best = RunSummary {
+            id,
+            start_time: Utc::now(),
+            end_time: None,
+            final_time: None,
+        };
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            Some(personal_best),
+            vec![],
+            vec![split1, split2],
+        )
+        .expect("splits should be valid");
 
         let current = make_ingame_time(60, 0, 11, 0); // +60s
         let result = splits.compare(&current);
@@ -464,8 +1043,29 @@ mod tests {
 
     #[test]
     fn compare_returns_correct_negative_delta() {
-        let mut splits = Splits::new();
-        splits.add_split("One".into(), make_ingame_time(70, 0, 15, 0));
+        let id = Uuid::new_v4();
+        let split1 = Split {
+            name: "One".to_string(),
+            percent: 70,
+            time: Some(Duration::from_secs(15 * 60)),
+            history: vec![HistoricalSplit {
+                run_id: id,
+                duration: Duration::from_secs(15 * 60),
+            }],
+        };
+        let personal_best = RunSummary {
+            id,
+            start_time: Utc::now(),
+            end_time: None,
+            final_time: None,
+        };
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            Some(personal_best),
+            vec![],
+            vec![split1],
+        )
+        .expect("splits should be valid");
 
         let current = make_ingame_time(70, 0, 14, 30); // -30s
         let result = splits.compare(&current);
@@ -478,9 +1078,30 @@ mod tests {
 
     #[test]
     fn compare_returns_zero_delta() {
-        let mut splits = Splits::new();
+        let id = Uuid::new_v4();
         let time = make_ingame_time(40, 0, 5, 30);
-        splits.add_split("One".into(), time.clone());
+        let split1 = Split {
+            name: "One".to_string(),
+            percent: time.percent,
+            time: Some(time.duration),
+            history: vec![HistoricalSplit {
+                run_id: id,
+                duration: time.duration,
+            }],
+        };
+        let personal_best = RunSummary {
+            id,
+            start_time: Utc::now(),
+            end_time: None,
+            final_time: None,
+        };
+        let splits = Splits::create_with_history(
+            PathBuf::from("dummy_path"),
+            Some(personal_best),
+            vec![],
+            vec![split1],
+        )
+        .expect("splits should be valid");
 
         let result = splits.compare(&time);
         assert!(result.is_some());
@@ -492,8 +1113,14 @@ mod tests {
 
     #[test]
     fn compare_returns_none_for_nonexistent_split() {
-        let mut splits = Splits::new();
-        splits.add_split("Unrelated".into(), make_ingame_time(10, 0, 1, 0));
+        let split1 = Split {
+            name: "Unrelated".to_string(),
+            percent: 10,
+            time: Some(Duration::from_secs(1 * 60)),
+            history: vec![],
+        };
+        let splits = Splits::create(PathBuf::from("dummy_path"), vec![split1])
+            .expect("splits should be valid");
 
         let result = splits.compare(&make_ingame_time(99, 0, 2, 0));
         assert!(result.is_none());
@@ -508,7 +1135,8 @@ mod tests {
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+            .expect("splits should be valid");
 
         let igt = InGameTime {
             percent: 10,
@@ -546,7 +1174,8 @@ mod tests {
             history: vec![existing_entry.clone()],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+            .expect("splits should be valid");
 
         let igt = InGameTime {
             percent: 10,
@@ -576,7 +1205,8 @@ mod tests {
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_1, split_2]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_1, split_2])
+            .expect("splits should be valid");
 
         let igt = InGameTime {
             percent: 10,
@@ -619,7 +1249,8 @@ mod tests {
             }],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+            .expect("splits should be valid");
 
         // Pre-existing active run
         splits.active_run = Some(ActiveRun {
@@ -669,7 +1300,8 @@ mod tests {
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_10, split_20]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_10, split_20])
+            .expect("splits should be valid");
 
         // Simulate first update at 10% to create the run
         let run_start_igt = InGameTime {
@@ -725,7 +1357,8 @@ mod tests {
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_5, split_40]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_5, split_40])
+            .expect("splits should be valid");
 
         // Step 1: Simulate reaching 40%
         splits.update_with_igt(&InGameTime {
@@ -796,7 +1429,8 @@ mod tests {
             },
         ];
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), splits);
+        let mut splits =
+            Splits::create(PathBuf::from("fake/path"), splits).expect("splits should be valid");
 
         // Start the run with the first IGT
         let igt1 = InGameTime {
@@ -847,7 +1481,8 @@ mod tests {
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![final_split]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![final_split])
+            .expect("splits should be valid");
 
         // First update: start and finish run immediately
         let igt = InGameTime {
@@ -906,7 +1541,8 @@ mod tests {
             },
         ];
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), splits);
+        let mut splits =
+            Splits::create(PathBuf::from("fake/path"), splits).expect("splits should be valid");
 
         // Start a run and finish it
         splits.update_with_igt(&InGameTime {
@@ -950,7 +1586,8 @@ mod tests {
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+            .expect("splits should be valid");
 
         // Start a run with a known split percent to have active_run
         let known_igt = InGameTime {
@@ -987,7 +1624,8 @@ mod tests {
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split]);
+        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+            .expect("splits should be valid");
 
         let unknown_igt = InGameTime {
             percent: 15, // No split at 15%
@@ -1030,7 +1668,8 @@ mod tests {
                     history: vec![],
                 },
             ],
-        );
+        )
+        .expect("splits should be valid");
 
         // Act – simulate a run that hits both splits in order
         splits.update_with_igt(&InGameTime {
@@ -1074,7 +1713,8 @@ mod tests {
                     history: vec![],
                 },
             ],
-        );
+        )
+        .expect("splits should be valid");
 
         // First run -> PB
         splits.update_with_igt(&InGameTime {
@@ -1134,7 +1774,8 @@ mod tests {
                     history: vec![],
                 },
             ],
-        );
+        )
+        .expect("splits should be valid");
 
         // First run -> slower PB
         splits.update_with_igt(&InGameTime {
@@ -1194,7 +1835,8 @@ mod tests {
                     history: vec![],
                 },
             ],
-        );
+        )
+        .expect("splits should be valid");
 
         // First run -> set PB
         splits.update_with_igt(&InGameTime {

@@ -112,11 +112,32 @@ struct SplitsV2 {
 
 impl From<SplitsV1> for SplitsV2 {
     fn from(v1: SplitsV1) -> Self {
-        SplitsV2 {
+        let mut splits = SplitsV2 {
             personal_best: None,
             runs: Vec::new(),
             splits: v1.splits.into_iter().map(|split| split.into()).collect(),
+        };
+
+        // Recover personal best from splits
+        let id = Uuid::new_v4();
+        for split in &mut splits.splits {
+            if let Some(pb_time) = split.time {
+                split.history.push(HistoricalSplitV2 {
+                    run_id: id,
+                    duration: pb_time,
+                });
+            }
         }
+
+        splits.splits.sort_by(|a, b| a.percent.cmp(&b.percent));
+
+        splits.personal_best = Some(RunSummaryV2 {
+            id: id,
+            start_time: Utc::now(),
+            end_time: None,
+            final_time: splits.splits.last().map(|s| s.time).flatten(),
+        });
+        splits
     }
 }
 
@@ -243,7 +264,7 @@ impl From<&Splits> for SplitsFileV2 {
     }
 }
 
-fn from_v2(file_v2: SplitsFileV2, path: &Path) -> Splits {
+fn from_v2(file_v2: SplitsFileV2, path: &Path) -> anyhow::Result<Splits> {
     let personal_best = file_v2.splits.personal_best.map(|pb| (&pb).into());
     let runs = file_v2.splits.runs.iter().map(|run| run.into()).collect();
     let splits = file_v2
@@ -252,7 +273,12 @@ fn from_v2(file_v2: SplitsFileV2, path: &Path) -> Splits {
         .iter()
         .map(|split| split.into())
         .collect();
-    Splits::create_with_history(path.to_path_buf(), personal_best, runs, splits)
+    Ok(Splits::create_with_history(
+        path.to_path_buf(),
+        personal_best,
+        runs,
+        splits,
+    )?)
 }
 
 pub fn load_from_file(path: &Path) -> Result<Splits> {
@@ -264,11 +290,11 @@ pub fn load_from_file(path: &Path) -> Result<Splits> {
     match version_info.version {
         SPLITS_FILE_VERSION_V1 => {
             let file_v1: SplitsFileV1 = serde_json::from_str(&contents)?;
-            Ok(from_v2(file_v1.into(), path))
+            from_v2(file_v1.into(), path)
         }
         SPLITS_FILE_VERSION_V2 => {
             let file_v2: SplitsFileV2 = serde_json::from_str(&contents)?;
-            Ok(from_v2(file_v2, path))
+            from_v2(file_v2, path)
         }
         v => bail!("Unsupported version: {}", v),
     }
@@ -434,11 +460,13 @@ mod tests {
                 time: Some(Duration::from_secs(567)),
                 history,
             }],
-        );
+        )
+        .expect("splits should be valid");
 
         // Round-trip
         let file_v2: SplitsFileV2 = (&splits).into();
-        let restored = from_v2(file_v2, std::path::Path::new("/tmp/fake.json"));
+        let restored = from_v2(file_v2, std::path::Path::new("/tmp/fake.json"))
+            .expect("splits should be valid after serialize/deserialize");
 
         // Check equality
         assert_eq!(restored.personal_best(), splits.personal_best());
@@ -472,10 +500,8 @@ mod tests {
 
         // Assertions
         assert_eq!(v2.version, SPLITS_FILE_VERSION_V2, "v2 version should be 2");
-        assert!(
-            v2.splits.personal_best.is_none(),
-            "personal_best should be None"
-        );
+        let pb = v2.splits.personal_best.unwrap();
+        assert_eq!(pb.final_time, v1.splits.splits[1].duration);
         assert!(v2.splits.runs.is_empty(), "runs should be empty");
         assert_eq!(
             v2.splits.splits.len(),
@@ -487,7 +513,8 @@ mod tests {
             assert_eq!(split_v2.name, split_v1.name);
             assert_eq!(split_v2.percent, split_v1.percent);
             assert_eq!(split_v2.time, split_v1.duration);
-            assert!(split_v2.history.is_empty(), "history should be empty");
+            assert_eq!(split_v2.history.len(), 1);
+            assert_eq!(split_v2.history[0].run_id, pb.id);
         }
     }
 
@@ -515,6 +542,14 @@ mod tests {
             "splits": {
                 "splits": [
                     { "name": "Invalid", "percent": 30, "duration": "" }
+                ]
+            }
+        }"#,
+            r#"{
+            "version": 1,
+            "splits": {
+                "splits": [
+                    { "name": "Negative", "percent": 40, "duration": "-1:00:00" }
                 ]
             }
         }"#,
@@ -596,6 +631,12 @@ mod tests {
                     "start_time": "2025-08-14T15:00:00Z",
                     "end_time": "2025-08-14T15:35:00Z",
                     "final_time": "0:35:00"
+                }},
+                {{
+                    "id": "{pb_id}",
+                    "start_time": "2025-08-15T12:00:00Z",
+                    "end_time": "2025-08-15T12:30:00Z",
+                    "final_time": "0:30:00"
                 }}
             ],
             "splits": [
@@ -607,13 +648,17 @@ mod tests {
                         {{
                             "run_id": "{run_id}",
                             "duration": "0:11:00"
+                        }},
+                        {{
+                            "run_id": "{pb_id}",
+                            "duration": "0:10:00"
                         }}
                     ]
                 }},
                 {{
                     "name": "Boss Fight",
                     "percent": 50,
-                    "time": "1:00:00",
+                    "time": "0:30:00",
                     "history": []
                 }}
             ]
@@ -633,20 +678,19 @@ mod tests {
         assert_eq!(split1.name, "Level 1");
         assert_eq!(split1.percent, 10);
         assert_eq!(split1.time, Some(Duration::from_secs(10 * 60)));
-        assert_eq!(split1.history.len(), 1);
+        assert_eq!(split1.history.len(), 2);
         assert_eq!(split1.history[0].duration, Duration::from_secs(11 * 60));
 
         let split2 = &splits.splits()[1];
         assert_eq!(split2.name, "Boss Fight");
         assert_eq!(split2.percent, 50);
-        assert_eq!(split2.time, Some(Duration::from_secs(3600)));
-        assert!(split2.history.is_empty());
+        assert_eq!(split2.time, Some(Duration::from_secs(30 * 60)));
 
         let pb = splits.personal_best().unwrap();
         assert_eq!(pb.final_time, Some(Duration::from_secs(30 * 60)));
 
         let runs = splits.runs();
-        assert_eq!(runs.len(), 1);
+        assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].final_time, Some(Duration::from_secs(35 * 60)));
         assert_eq!(runs[0].id, split1.history[0].run_id);
 
@@ -682,15 +726,11 @@ mod tests {
         assert_eq!(splits.splits()[0].name, "Level 1");
         assert_eq!(splits.splits()[0].percent, 10);
         assert_eq!(splits.splits()[0].time, Some(Duration::from_secs(10 * 60)));
-        assert!(splits.splits()[0].history.is_empty());
         assert_eq!(splits.splits()[1].name, "Boss Fight");
         assert_eq!(splits.splits()[1].percent, 50);
         assert_eq!(splits.splits()[1].time, Some(Duration::from_secs(1 * 3600)));
-        assert!(splits.splits()[1].history.is_empty());
         assert_eq!(splits.path(), Some(&file_path));
         assert_eq!(splits.active_run(), None);
-        assert_eq!(splits.personal_best(), None);
-        assert!(splits.runs().is_empty());
 
         Ok(())
     }
@@ -716,7 +756,8 @@ mod tests {
                     history: Vec::new(),
                 },
             ],
-        );
+        )
+        .expect("splits should be valid");
 
         splits.save_to_file()?;
 
@@ -765,7 +806,8 @@ mod tests {
                     }],
                 },
             ],
-        );
+        )
+        .expect("splits should be valid");
 
         // Save to file
         original_splits.save_to_file()?;
