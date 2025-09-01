@@ -350,6 +350,13 @@ fn main() -> Result<()> {
                         Splits::print_split(splits.compute_name_width(), split);
                     }
 
+                    let bpt = splits.best_possible_time();
+                    println!();
+                    let name_width = splits.compute_name_width();
+                    let name_fmt = Splits::pad_str("BPT:", name_width);
+                    let time_fmt = Splits::format_time(bpt);
+                    println!("{} {:>8} {:>8}", name_fmt, "      ", time_fmt);
+
                     // FIXME: this doesn't work if the IGT/percentage is <= first split
                     // Not sure whether there's a solution without integrating with LiveSplit / providing explicit GUI controls
                     splits.initialize_active_run(&igt);

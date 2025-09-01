@@ -3,7 +3,7 @@ mod splits;
 
 pub use splits::Splits;
 
-use colored::Colorize;
+use colored::{Color, Colorize};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -12,6 +12,7 @@ use crate::in_game_time::InGameTime;
 pub struct SplitsDisplay {
     last_run_id: Option<Uuid>,
     pb_snapshot: Vec<Option<Duration>>,
+    best_segs_snapshot: Vec<Option<Duration>>,
 }
 
 impl SplitsDisplay {
@@ -19,6 +20,7 @@ impl SplitsDisplay {
         Self {
             last_run_id: None,
             pb_snapshot: Vec::new(),
+            best_segs_snapshot: Vec::new(),
         }
     }
 
@@ -29,12 +31,12 @@ impl SplitsDisplay {
         current_igt: &InGameTime,
         window_size: usize,
     ) -> Vec<String> {
-        // --- 1. Detect run start & snapshot PBs ---
+        // --- 1. Detect run start & snapshot PBs and best segments ---
         if let Some(active_run) = splits.active_run() {
             if Some(active_run.id) != self.last_run_id {
                 self.last_run_id = Some(active_run.id);
-                // Snapshot PBs from current model
                 self.pb_snapshot = splits.splits().iter().map(|s| s.time).collect();
+                self.best_segs_snapshot = splits.splits().iter().map(|s| s.best_segment).collect();
             }
         }
 
@@ -95,7 +97,17 @@ impl SplitsDisplay {
                 (pb_time, None)
             };
 
-            // Format name (unicode-aware)
+            // Check for golds
+            let gold = match (
+                self.best_segs_snapshot.get(idx).copied().flatten(),
+                split.best_segment,
+            ) {
+                (Some(old_best), Some(new_best)) => new_best < old_best,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+
+            // Format name
             let name_fmt = {
                 let truncated = Splits::truncate_name(&split.name, name_width);
                 Splits::pad_str(&truncated, name_width)
@@ -106,14 +118,30 @@ impl SplitsDisplay {
 
             // Format delta
             let delta_fmt = match delta {
-                Some(d) if d >= 0 => format!("+{:02}:{:02}", d / 60, d % 60).red(), // red()
-                Some(d) if d < 0 => format!("-{:02}:{:02}", (-d) / 60, (-d) % 60).green(), // green()
-                Some(_) => String::from("      ").white(),
-                None => String::from("      ").white(),
+                Some(d) if gold => {
+                    format!("-{:02}:{:02}", (-d) / 60, (-d) % 60).color(Color::TrueColor {
+                        r: 255,
+                        g: 227,
+                        b: 0,
+                    })
+                }
+                Some(d) if d >= 0 => format!("+{:02}:{:02}", d / 60, d % 60).red(),
+                Some(d) if d < 0 => format!("-{:02}:{:02}", (-d) / 60, (-d) % 60).green(),
+                _ => String::from("      ").white(),
             };
 
             lines.push(format!("{} {:>8} {:>8}", name_fmt, delta_fmt, time_fmt));
         }
+
+        // --- 5. Append BPT ---
+        let bpt = splits.best_possible_time();
+        // Blank line to separate splits from BPT
+        lines.push(String::new());
+
+        let name_width = splits.compute_name_width();
+        let name_fmt = Splits::pad_str("BPT:", name_width);
+        let time_fmt = Splits::format_time(bpt);
+        lines.push(format!("{} {:>8} {:>8}", name_fmt, "      ", time_fmt));
 
         lines
     }
