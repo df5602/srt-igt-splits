@@ -179,6 +179,7 @@ impl From<&SplitV2> for Split {
             name: sv2.name.clone(),
             percent: sv2.percent,
             time: sv2.time.map(|h| h.0),
+            best_segment: None,
             history: sv2.history.iter().map(|h| h.into()).collect(),
         }
     }
@@ -416,6 +417,7 @@ mod tests {
             name: "Test".to_string(),
             percent: 75,
             time: Some(Duration::from_secs(200)),
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: Uuid::new_v4(),
                 duration: Duration::from_secs(150),
@@ -458,6 +460,7 @@ mod tests {
                 name: "Test Split".to_string(),
                 percent: 50,
                 time: Some(Duration::from_secs(567)),
+                best_segment: None,
                 history,
             }],
         )
@@ -747,12 +750,14 @@ mod tests {
                     name: "Start".to_string(),
                     percent: 25,
                     time: Some(Duration::from_secs(5)),
+                    best_segment: None,
                     history: Vec::new(),
                 },
                 Split {
                     name: "End".to_string(),
                     percent: 100,
                     time: Some(Duration::from_secs(5 * 60)),
+                    best_segment: None,
                     history: Vec::new(),
                 },
             ],
@@ -791,6 +796,7 @@ mod tests {
                     name: "Split 1".to_string(),
                     percent: 25,
                     time: Some(Duration::from_secs(600)),
+                    best_segment: None,
                     history: vec![HistoricalSplit {
                         run_id,
                         duration: Duration::from_secs(590),
@@ -800,6 +806,7 @@ mod tests {
                     name: "Split 2".to_string(),
                     percent: 75,
                     time: Some(Duration::from_secs(1800)),
+                    best_segment: None,
                     history: vec![HistoricalSplit {
                         run_id,
                         duration: Duration::from_secs(1750),

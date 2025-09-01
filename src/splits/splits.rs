@@ -40,6 +40,7 @@ pub struct Split {
     pub name: String,
     pub percent: u32,
     pub time: Option<Duration>,
+    pub best_segment: Option<Duration>,
     pub history: Vec<HistoricalSplit>,
 }
 
@@ -117,6 +118,32 @@ impl Splits {
 
     pub fn personal_best(&self) -> Option<&RunSummary> {
         self.personal_best.as_ref()
+    }
+
+    pub fn sum_of_bests(&self) -> Option<Duration> {
+        match self.splits.last().map(|s| s.best_segment).flatten() {
+            Some(_) => Some(self.splits.iter().filter_map(|s| s.best_segment).sum()),
+            None => None,
+        }
+    }
+
+    pub fn best_possible_time(&self) -> Option<Duration> {
+        if self.splits.last()?.best_segment.is_none() {
+            return None;
+        }
+
+        if let Some(active_run) = self.active_run() {
+            let elapsed = active_run.latest_split.duration;
+            let future_best_segments = self
+                .splits
+                .iter()
+                .filter(|&s| s.percent > active_run.latest_split.percent)
+                .filter_map(|s| s.best_segment)
+                .sum();
+            Some(elapsed + future_best_segments)
+        } else {
+            self.sum_of_bests()
+        }
     }
 
     pub fn runs(&self) -> &Vec<RunSummary> {
@@ -230,6 +257,17 @@ impl Splits {
             }
         }
 
+        // Compute best segments
+        let best_segments: Vec<_> = self
+            .splits
+            .iter()
+            .map(|s| self.compute_best_segment_for(s.percent))
+            .collect();
+
+        for (split, best_segment) in self.splits.iter_mut().zip(best_segments) {
+            split.best_segment = best_segment;
+        }
+
         Ok(())
     }
 
@@ -242,10 +280,69 @@ impl Splits {
         self.splits.iter_mut().find(|s| s.percent == time.percent)
     }
 
+    fn find_split_index_by_percent(&self, time: &InGameTime) -> Option<usize> {
+        self.splits.iter().position(|s| s.percent == time.percent)
+    }
+
     fn is_final_split(&self, time: &InGameTime) -> bool {
         self.splits
             .last()
             .map_or(false, |s| s.percent == time.percent)
+    }
+
+    /// Computes the delta time for the given split in the context of a run.
+    ///
+    /// Delta time is defined as the difference between the current split’s
+    /// duration and the latest earlier split that has a recorded time for
+    /// the same run. If no earlier split exists, the delta is simply the
+    /// current duration (i.e. the split’s absolute time).
+    ///
+    /// If the data is inconsistent (e.g. the current duration is smaller
+    /// than a previous duration), this method falls back to returning the
+    /// current duration as if no previous split were found. This avoids
+    /// producing nonsensical negative delta times, which can only happen
+    /// with corrupted or manually edited split files.
+    ///
+    /// FIXME: we might eventually want to validate monotonicity of split
+    /// times in `validate()` so that such cases are caught earlier.
+    fn compute_delta_for(&self, run_id: Uuid, current: &InGameTime) -> Option<Duration> {
+        self.find_split_index_by_percent(current).map(|idx| {
+            self.splits[..idx]
+                .iter()
+                .rev()
+                .filter_map(|split| {
+                    split
+                        .history
+                        .iter()
+                        .find(|&hs| hs.run_id == run_id)
+                        .map(|hs| hs.duration)
+                })
+                .next()
+                .map(|prev| current.duration.checked_sub(prev))
+                .flatten()
+                .unwrap_or(current.duration)
+        })
+    }
+
+    fn compute_best_segment_for(&self, percent: u32) -> Option<Duration> {
+        self.splits
+            .iter()
+            .find(|&s| s.percent == percent)
+            .and_then(|split| {
+                split
+                    .history
+                    .iter()
+                    .filter_map(|hs| {
+                        self.compute_delta_for(
+                            hs.run_id,
+                            &InGameTime {
+                                percent,
+                                duration: hs.duration,
+                            },
+                        )
+                    })
+                    .min()
+            })
     }
 
     fn compare(&self, current: &InGameTime) -> Option<(i64, &Split)> {
@@ -309,18 +406,43 @@ impl Splits {
     }
 
     fn record_split_time(&mut self, run_id: Uuid, current: &InGameTime) {
-        if let Some(current_split) = self.find_by_percent_mut(current) {
+        let delta = self.compute_delta_for(run_id, current);
+
+        let idx = self
+            .splits
+            .iter()
+            .position(|s| s.percent == current.percent);
+
+        if let Some(idx) = idx {
+            let current_split = &mut self.splits[idx];
+
             let existing = current_split
                 .history
                 .last_mut()
                 .filter(|hs| hs.run_id == run_id);
 
             match existing {
-                Some(entry) => entry.duration = current.duration,
-                None => current_split.history.push(HistoricalSplit {
-                    run_id,
-                    duration: current.duration,
-                }),
+                Some(entry) => {
+                    entry.duration = current.duration;
+
+                    // Recompute best segment since we might have overwritten it when recording the previous time for this split
+                    let best_segment = self.compute_best_segment_for(current.percent);
+                    self.splits[idx].best_segment = best_segment;
+                }
+                None => {
+                    current_split.history.push(HistoricalSplit {
+                        run_id,
+                        duration: current.duration,
+                    });
+
+                    if let Some(delta) = delta {
+                        match current_split.best_segment {
+                            Some(best) if delta < best => current_split.best_segment = Some(delta),
+                            None => current_split.best_segment = Some(delta),
+                            _ => {} // delta >= best, do nothing
+                        }
+                    }
+                }
             }
         }
     }
@@ -484,6 +606,7 @@ impl Splits {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tempfile::tempdir;
 
     fn make_ingame_time(percent: u32, hours: u64, minutes: u64, secs: u64) -> InGameTime {
         InGameTime {
@@ -504,18 +627,21 @@ mod tests {
             name: "C".to_string(),
             percent: 75,
             time: None,
+            best_segment: None,
             history: vec![],
         };
         let split2 = Split {
             name: "A".to_string(),
             percent: 25,
             time: None,
+            best_segment: None,
             history: vec![],
         };
         let split3 = Split {
             name: "B".to_string(),
             percent: 50,
             time: None,
+            best_segment: None,
             history: vec![],
         };
 
@@ -537,12 +663,14 @@ mod tests {
                 name: "First".to_string(),
                 percent: 50,
                 time: None,
+                best_segment: None,
                 history: Vec::new(),
             },
             Split {
                 name: "Second".to_string(),
                 percent: 50,
                 time: None,
+                best_segment: None,
                 history: Vec::new(),
             },
         ];
@@ -647,6 +775,7 @@ mod tests {
             name: "Split".to_string(),
             percent: 50,
             time: None,
+            best_segment: None,
             history: vec![
                 HistoricalSplit {
                     run_id: run_c.id,
@@ -692,6 +821,7 @@ mod tests {
                 name: "First Split".to_string(),
                 percent: 50,
                 time: None,
+                best_segment: None,
                 history: vec![
                     HistoricalSplit {
                         run_id: run.id,
@@ -711,6 +841,7 @@ mod tests {
                 name: "Final Split".to_string(),
                 percent: 100,
                 time: None,
+                best_segment: None,
                 history: vec![],
             },
         ];
@@ -744,6 +875,7 @@ mod tests {
             name: "Early".to_string(),
             percent: 50,
             time: None,
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: run.id,
                 duration: Duration::from_secs(60),
@@ -755,6 +887,7 @@ mod tests {
             name: "Final".to_string(),
             percent: 100,
             time: None,
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: run.id,
                 duration: Duration::from_secs(90),
@@ -802,6 +935,7 @@ mod tests {
             name: "Split".to_string(),
             percent: 50,
             time: None,
+            best_segment: None,
             history: vec![
                 HistoricalSplit {
                     run_id: known_run.id,
@@ -843,6 +977,7 @@ mod tests {
             name: "Final".to_string(),
             percent: 100,
             time: None,
+            best_segment: None,
             history: vec![],
         };
 
@@ -901,6 +1036,7 @@ mod tests {
             name: "50%".into(),
             percent: 50,
             time: None,
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: pb_run.id,
                 duration: Duration::from_secs(30),
@@ -910,6 +1046,7 @@ mod tests {
             name: "100%".into(),
             percent: 100,
             time: None,
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: pb_run.id,
                 duration: Duration::from_secs(60),
@@ -942,6 +1079,7 @@ mod tests {
             name: "Split 1".to_string(),
             percent: 50,
             time: Some(Duration::from_secs(30)),
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: run.id,
                 duration: Duration::from_secs(30),
@@ -961,17 +1099,65 @@ mod tests {
     }
 
     #[test]
+    fn validate_computes_best_segments() {
+        let run1 = Uuid::new_v4();
+        let run2 = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: None,
+            best_segment: None,
+            history: vec![
+                HistoricalSplit {
+                    run_id: run1,
+                    duration: Duration::from_secs(60),
+                },
+                HistoricalSplit {
+                    run_id: run2,
+                    duration: Duration::from_secs(50),
+                },
+            ],
+        };
+
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: None,
+            best_segment: None,
+            history: vec![
+                HistoricalSplit {
+                    run_id: run1,
+                    duration: Duration::from_secs(145),
+                },
+                HistoricalSplit {
+                    run_id: run2,
+                    duration: Duration::from_secs(140),
+                },
+            ],
+        };
+
+        let splits = Splits::create(PathBuf::from("dummy"), vec![split_a, split_b]).unwrap();
+
+        // After validation, best segments should be filled
+        assert_eq!(splits.splits[0].best_segment, Some(Duration::from_secs(50)));
+        assert_eq!(splits.splits[1].best_segment, Some(Duration::from_secs(85))); // 1:25
+    }
+
+    #[test]
     fn find_by_percent_finds_correct_split() {
         let split1 = Split {
             name: "Alpha".to_string(),
             percent: 10,
             time: Some(Duration::from_secs(60)),
+            best_segment: None,
             history: vec![],
         };
         let split2 = Split {
             name: "Beta".to_string(),
             percent: 20,
             time: Some(Duration::from_secs(2 * 60)),
+            best_segment: None,
             history: vec![],
         };
         let splits = Splits::create(PathBuf::from("dummy_path"), vec![split1, split2])
@@ -988,6 +1174,7 @@ mod tests {
             name: "One".to_string(),
             percent: 30,
             time: Some(Duration::from_secs(3 * 60)),
+            best_segment: None,
             history: vec![],
         };
         let splits = Splits::create(PathBuf::from("dummy_path"), vec![split1])
@@ -998,12 +1185,364 @@ mod tests {
     }
 
     #[test]
+    fn compute_delta_for_simple_run() {
+        let run_id = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: None,
+            best_segment: None,
+            history: vec![HistoricalSplit {
+                run_id,
+                duration: Duration::from_secs(60),
+            }],
+        };
+
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: None,
+            best_segment: None,
+            history: vec![HistoricalSplit {
+                run_id,
+                duration: Duration::from_secs(150), // 2:30
+            }],
+        };
+
+        let splits = Splits::create(PathBuf::from("dummy"), vec![split_a, split_b]).unwrap();
+
+        // Case 1: first split
+        let delta_a = splits.compute_delta_for(
+            run_id,
+            &InGameTime {
+                percent: 10,
+                duration: Duration::from_secs(60),
+            },
+        );
+        assert_eq!(delta_a, Some(Duration::from_secs(60)));
+
+        // Case 2: second split
+        let delta_b = splits.compute_delta_for(
+            run_id,
+            &InGameTime {
+                percent: 20,
+                duration: Duration::from_secs(150),
+            },
+        );
+        assert_eq!(delta_b, Some(Duration::from_secs(90))); // 1:30
+    }
+
+    #[test]
+    fn compute_delta_skipped_split() {
+        let run_id = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: None,
+            best_segment: None,
+            history: vec![HistoricalSplit {
+                run_id,
+                duration: Duration::from_secs(60), // 1:00
+            }],
+        };
+
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: None,
+            best_segment: None,
+            history: vec![], // skipped in this run
+        };
+
+        let split_c = Split {
+            name: "C".into(),
+            percent: 30,
+            time: None,
+            best_segment: None,
+            history: vec![HistoricalSplit {
+                run_id,
+                duration: Duration::from_secs(150), // 2:30
+            }],
+        };
+
+        let splits =
+            Splits::create(PathBuf::from("dummy"), vec![split_a, split_b, split_c]).unwrap();
+
+        // First split delta
+        let delta_a = splits.compute_delta_for(
+            run_id,
+            &InGameTime {
+                percent: 10,
+                duration: Duration::from_secs(60),
+            },
+        );
+        assert_eq!(delta_a, Some(Duration::from_secs(60)));
+
+        // Split C delta (skipped B)
+        let delta_c = splits.compute_delta_for(
+            run_id,
+            &InGameTime {
+                percent: 30,
+                duration: Duration::from_secs(150),
+            },
+        );
+        assert_eq!(delta_c, Some(Duration::from_secs(90))); // 1:30
+    }
+
+    #[test]
+    fn compute_best_segment_simple() {
+        let run1 = Uuid::new_v4();
+        let run2 = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: None,
+            best_segment: None,
+            history: vec![
+                HistoricalSplit {
+                    run_id: run1,
+                    duration: Duration::from_secs(60),
+                },
+                HistoricalSplit {
+                    run_id: run2,
+                    duration: Duration::from_secs(50),
+                },
+            ],
+        };
+
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: None,
+            best_segment: None,
+            history: vec![
+                HistoricalSplit {
+                    run_id: run1,
+                    duration: Duration::from_secs(145),
+                },
+                HistoricalSplit {
+                    run_id: run2,
+                    duration: Duration::from_secs(140),
+                },
+            ],
+        };
+
+        let splits = Splits::create(PathBuf::from("dummy"), vec![split_a, split_b]).unwrap();
+
+        // Best segment for A (first split) -> min absolute time
+        let best_a = splits.compute_best_segment_for(10);
+        assert_eq!(best_a, Some(Duration::from_secs(50)));
+
+        // Best segment for B → min delta across runs
+        let best_b = splits.compute_best_segment_for(20);
+        assert_eq!(best_b, Some(Duration::from_secs(85))); // 1:25
+    }
+
+    #[test]
+    fn sum_of_bests_returns_sum_of_all_best_segments() {
+        let run1 = Uuid::new_v4();
+        let run2 = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: Some(Duration::from_secs(50)),
+            best_segment: Some(Duration::from_secs(50)),
+            history: vec![
+                HistoricalSplit {
+                    run_id: run1,
+                    duration: Duration::from_secs(50),
+                },
+                HistoricalSplit {
+                    run_id: run2,
+                    duration: Duration::from_secs(60),
+                },
+            ],
+        };
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: Some(Duration::from_secs(140)),
+            best_segment: Some(Duration::from_secs(70)),
+            history: vec![
+                HistoricalSplit {
+                    run_id: run1,
+                    duration: Duration::from_secs(140),
+                },
+                HistoricalSplit {
+                    run_id: run2,
+                    duration: Duration::from_secs(130),
+                },
+            ],
+        };
+        let split_c = Split {
+            name: "C".into(),
+            percent: 30,
+            time: Some(Duration::from_secs(240)),
+            best_segment: Some(Duration::from_secs(100)),
+            history: vec![
+                HistoricalSplit {
+                    run_id: run1,
+                    duration: Duration::from_secs(240),
+                },
+                HistoricalSplit {
+                    run_id: run2,
+                    duration: Duration::from_secs(250),
+                },
+            ],
+        };
+
+        let splits =
+            Splits::create(PathBuf::from("dummy"), vec![split_a, split_b, split_c]).unwrap();
+
+        // 50 + 70 + 100 = 220
+        assert_eq!(splits.sum_of_bests(), Some(Duration::from_secs(220)));
+    }
+
+    #[test]
+    fn sum_of_bests_returns_none_if_last_split_not_finished() {
+        let run1 = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: Some(Duration::from_secs(50)),
+            best_segment: Some(Duration::from_secs(50)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(50),
+            }],
+        };
+
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: None,
+            best_segment: None, // last split never finished
+            history: vec![],
+        };
+
+        let splits = Splits::create(PathBuf::from("dummy"), vec![split_a, split_b]).unwrap();
+
+        // Expect None because the last split has no best segment
+        assert_eq!(splits.sum_of_bests(), None);
+    }
+
+    #[test]
+    fn bpt_computes_as_elapsed_plus_future_best_segments() {
+        let run1 = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: Some(Duration::from_secs(50)),
+            best_segment: Some(Duration::from_secs(50)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(50),
+            }],
+        };
+
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: Some(Duration::from_secs(120)),
+            best_segment: Some(Duration::from_secs(70)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(120),
+            }],
+        };
+
+        let split_c = Split {
+            name: "C".into(),
+            percent: 30,
+            time: Some(Duration::from_secs(240)),
+            best_segment: Some(Duration::from_secs(120)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(240),
+            }],
+        };
+
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![split_a, split_b, split_c],
+        )
+        .unwrap();
+
+        // Start of run: expected BPT = SoB
+        assert_eq!(splits.best_possible_time(), splits.sum_of_bests());
+
+        // Simulate an active run halfway through split B
+        splits.update_with_igt(&InGameTime {
+            percent: 10,
+            duration: Duration::from_secs(60),
+        });
+
+        // Expected BPT = elapsed so far (60) + future best segments (70 + 120) = 250
+        assert_eq!(splits.best_possible_time(), Some(Duration::from_secs(250)));
+
+        // Finish the run
+        splits.update_with_igt(&InGameTime {
+            percent: 30,
+            duration: Duration::from_secs(270),
+        });
+
+        // Expected BPT = final time
+        assert_eq!(splits.best_possible_time(), Some(Duration::from_secs(270)));
+    }
+
+    #[test]
+    fn bpt_returns_none_if_last_split_not_finished() {
+        let run1 = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: Some(Duration::from_secs(50)),
+            best_segment: Some(Duration::from_secs(50)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(50),
+            }],
+        };
+
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: None,
+            best_segment: None, // last split never finished
+            history: vec![],
+        };
+
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![split_a, split_b],
+        )
+        .unwrap();
+
+        // Simulate an active run halfway through split B
+        splits.update_with_igt(&InGameTime {
+            percent: 10,
+            duration: Duration::from_secs(60),
+        });
+
+        // Expect None because the last split has no best segment
+        assert_eq!(splits.best_possible_time(), None);
+    }
+
+    #[test]
     fn compare_returns_correct_positive_delta() {
         let id = Uuid::new_v4();
         let split1 = Split {
             name: "One".to_string(),
             percent: 50,
             time: Some(Duration::from_secs(8 * 60 + 30)),
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: id,
                 duration: Duration::from_secs(8 * 60 + 30),
@@ -1013,6 +1552,7 @@ mod tests {
             name: "Two".to_string(),
             percent: 60,
             time: Some(Duration::from_secs(10 * 60)),
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: id,
                 duration: Duration::from_secs(10 * 60),
@@ -1048,6 +1588,7 @@ mod tests {
             name: "One".to_string(),
             percent: 70,
             time: Some(Duration::from_secs(15 * 60)),
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: id,
                 duration: Duration::from_secs(15 * 60),
@@ -1084,6 +1625,7 @@ mod tests {
             name: "One".to_string(),
             percent: time.percent,
             time: Some(time.duration),
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id: id,
                 duration: time.duration,
@@ -1117,6 +1659,7 @@ mod tests {
             name: "Unrelated".to_string(),
             percent: 10,
             time: Some(Duration::from_secs(1 * 60)),
+            best_segment: None,
             history: vec![],
         };
         let splits = Splits::create(PathBuf::from("dummy_path"), vec![split1])
@@ -1132,10 +1675,11 @@ mod tests {
             name: "First Split".into(),
             percent: 10,
             time: Some(Duration::from_secs(20)),
+            best_segment: None,
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+        let mut splits = Splits::create(tempdir().unwrap().path().join("splits.json"), vec![split])
             .expect("splits should be valid");
 
         let igt = InGameTime {
@@ -1171,10 +1715,11 @@ mod tests {
             name: "First Split".into(),
             percent: 10,
             time: Some(Duration::from_secs(20)),
+            best_segment: None,
             history: vec![existing_entry.clone()],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+        let mut splits = Splits::create(tempdir().unwrap().path().join("splits.json"), vec![split])
             .expect("splits should be valid");
 
         let igt = InGameTime {
@@ -1196,17 +1741,22 @@ mod tests {
             name: "First Split".into(),
             percent: 10,
             time: Some(Duration::from_secs(20)),
+            best_segment: None,
             history: vec![],
         };
         let split_2 = Split {
             name: "Second Split".into(),
             percent: 20,
             time: Some(Duration::from_secs(40)),
+            best_segment: None,
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_1, split_2])
-            .expect("splits should be valid");
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![split_1, split_2],
+        )
+        .expect("splits should be valid");
 
         let igt = InGameTime {
             percent: 10,
@@ -1243,13 +1793,14 @@ mod tests {
             name: "20% Split".into(),
             percent: 20,
             time: Some(original_duration),
+            best_segment: None,
             history: vec![HistoricalSplit {
                 run_id,
                 duration: original_duration,
             }],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+        let mut splits = Splits::create(tempdir().unwrap().path().join("splits.json"), vec![split])
             .expect("splits should be valid");
 
         // Pre-existing active run
@@ -1290,6 +1841,7 @@ mod tests {
             name: "First Split".into(),
             percent: 10,
             time: Some(Duration::from_secs(20)),
+            best_segment: None,
             history: vec![],
         };
 
@@ -1297,11 +1849,15 @@ mod tests {
             name: "Second Split".into(),
             percent: 20,
             time: Some(Duration::from_secs(40)),
+            best_segment: None,
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_10, split_20])
-            .expect("splits should be valid");
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![split_10, split_20],
+        )
+        .expect("splits should be valid");
 
         // Simulate first update at 10% to create the run
         let run_start_igt = InGameTime {
@@ -1342,11 +1898,150 @@ mod tests {
     }
 
     #[test]
+    fn recording_new_split_updates_best_segment_if_better() {
+        let run1 = Uuid::new_v4();
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: None,
+            best_segment: Some(Duration::from_secs(60)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(60),
+            }],
+        };
+        let split_b = Split {
+            name: "B".into(),
+            percent: 20,
+            time: None,
+            best_segment: Some(Duration::from_secs(90)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(150),
+            }],
+        };
+        let split_c = Split {
+            name: "C".into(),
+            percent: 30,
+            time: None,
+            best_segment: Some(Duration::from_secs(100)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(250),
+            }],
+        };
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![split_a, split_b, split_c],
+        )
+        .unwrap();
+
+        // Record a new faster run2 entry at 0:50
+        splits.update_with_igt(&InGameTime {
+            percent: 10,
+            duration: Duration::from_secs(50),
+        });
+        splits.update_with_igt(&InGameTime {
+            percent: 20,
+            duration: Duration::from_secs(130),
+        });
+        // Third split is slower
+        splits.update_with_igt(&InGameTime {
+            percent: 30,
+            duration: Duration::from_secs(240),
+        });
+
+        // Best segment should now be updated to 0:50 and 1:20, respectively
+        assert_eq!(splits.splits[0].best_segment, Some(Duration::from_secs(50)));
+        assert_eq!(splits.splits[1].best_segment, Some(Duration::from_secs(80)));
+
+        // Best segment of last split should remain the same
+        assert_eq!(
+            splits.splits[2].best_segment,
+            Some(Duration::from_secs(100))
+        );
+    }
+
+    #[test]
+    fn recording_new_split_sets_best_segment_when_none() {
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: None,
+            best_segment: None, // no previous best
+            history: vec![],
+        };
+
+        let mut splits =
+            Splits::create(tempdir().unwrap().path().join("splits.json"), vec![split_a]).unwrap();
+
+        // Record a first IGT
+        splits.update_with_igt(&InGameTime {
+            percent: 10,
+            duration: Duration::from_secs(60),
+        });
+
+        // Best segment should now be set to 1:00
+        assert_eq!(splits.splits[0].best_segment, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn overwriting_previous_best_recomputes_best_segment() {
+        let run1 = Uuid::new_v4();
+
+        let split_a = Split {
+            name: "A".into(),
+            percent: 10,
+            time: None,
+            best_segment: Some(Duration::from_secs(60)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(60),
+            }],
+        };
+        let split_b = Split {
+            name: "B".into(),
+            percent: 50,
+            time: None,
+            best_segment: Some(Duration::from_secs(70)),
+            history: vec![HistoricalSplit {
+                run_id: run1,
+                duration: Duration::from_secs(130),
+            }],
+        };
+
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![split_a, split_b],
+        )
+        .unwrap();
+
+        // Record first time for run 2
+        splits.update_with_igt(&InGameTime {
+            percent: 10,
+            duration: Duration::from_secs(50),
+        });
+
+        // Best segment should now be 0:50
+        assert_eq!(splits.splits[0].best_segment, Some(Duration::from_secs(50)));
+
+        // Overwrite run 2 with a slower time
+        splits.update_with_igt(&InGameTime {
+            percent: 10,
+            duration: Duration::from_secs(70),
+        });
+
+        // Best segment should now recompute to run1 (1:00)
+        assert_eq!(splits.splits[0].best_segment, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
     fn reset_triggers_new_run_on_percent_regression() {
         let split_5 = Split {
             name: "Intro".into(),
             percent: 5,
             time: Some(Duration::from_secs(10)),
+            best_segment: None,
             history: vec![],
         };
 
@@ -1354,11 +2049,15 @@ mod tests {
             name: "Mid Game".into(),
             percent: 40,
             time: Some(Duration::from_secs(80)),
+            best_segment: None,
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split_5, split_40])
-            .expect("splits should be valid");
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![split_5, split_40],
+        )
+        .expect("splits should be valid");
 
         // Step 1: Simulate reaching 40%
         splits.update_with_igt(&InGameTime {
@@ -1413,24 +2112,27 @@ mod tests {
                 name: "Split 1".into(),
                 percent: 10,
                 time: Some(Duration::from_secs(10)),
+                best_segment: None,
                 history: vec![],
             },
             Split {
                 name: "Split 2".into(),
                 percent: 50,
                 time: Some(Duration::from_secs(50)),
+                best_segment: None,
                 history: vec![],
             },
             Split {
                 name: "Final Split".into(),
                 percent: 100,
                 time: Some(Duration::from_secs(100)),
+                best_segment: None,
                 history: vec![],
             },
         ];
 
-        let mut splits =
-            Splits::create(PathBuf::from("fake/path"), splits).expect("splits should be valid");
+        let mut splits = Splits::create(tempdir().unwrap().path().join("splits.json"), splits)
+            .expect("splits should be valid");
 
         // Start the run with the first IGT
         let igt1 = InGameTime {
@@ -1478,11 +2180,15 @@ mod tests {
             name: "Final Split".into(),
             percent: 100,
             time: Some(Duration::from_secs(120)),
+            best_segment: None,
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![final_split])
-            .expect("splits should be valid");
+        let mut splits = Splits::create(
+            tempdir().unwrap().path().join("splits.json"),
+            vec![final_split],
+        )
+        .expect("splits should be valid");
 
         // First update: start and finish run immediately
         let igt = InGameTime {
@@ -1531,18 +2237,20 @@ mod tests {
                 name: "First Split".into(),
                 percent: 10,
                 time: Some(Duration::from_secs(20)),
+                best_segment: None,
                 history: vec![],
             },
             Split {
                 name: "Final Split".into(),
                 percent: 100,
                 time: Some(Duration::from_secs(200)),
+                best_segment: None,
                 history: vec![],
             },
         ];
 
-        let mut splits =
-            Splits::create(PathBuf::from("fake/path"), splits).expect("splits should be valid");
+        let mut splits = Splits::create(tempdir().unwrap().path().join("splits.json"), splits)
+            .expect("splits should be valid");
 
         // Start a run and finish it
         splits.update_with_igt(&InGameTime {
@@ -1583,10 +2291,11 @@ mod tests {
             name: "Known Split".into(),
             percent: 50,
             time: Some(Duration::from_secs(100)),
+            best_segment: None,
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+        let mut splits = Splits::create(tempdir().unwrap().path().join("splits.json"), vec![split])
             .expect("splits should be valid");
 
         // Start a run with a known split percent to have active_run
@@ -1621,10 +2330,11 @@ mod tests {
             name: "First Split".into(),
             percent: 10,
             time: Some(Duration::from_secs(20)),
+            best_segment: None,
             history: vec![],
         };
 
-        let mut splits = Splits::create(PathBuf::from("fake/path"), vec![split])
+        let mut splits = Splits::create(tempdir().unwrap().path().join("splits.json"), vec![split])
             .expect("splits should be valid");
 
         let unknown_igt = InGameTime {
@@ -1653,18 +2363,20 @@ mod tests {
     fn first_run_sets_personal_best() {
         // Arrange
         let mut splits = Splits::create(
-            PathBuf::from("fake/path"),
+            tempdir().unwrap().path().join("splits.json"),
             vec![
                 Split {
                     name: "Split 1".into(),
                     percent: 10,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
                 Split {
                     name: "Split 2".into(),
                     percent: 20,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
             ],
@@ -1698,18 +2410,20 @@ mod tests {
         use std::time::Duration;
 
         let mut splits = Splits::create(
-            PathBuf::from("fake/path"),
+            tempdir().unwrap().path().join("splits.json"),
             vec![
                 Split {
                     name: "Split 1".into(),
                     percent: 10,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
                 Split {
                     name: "Split 2".into(),
                     percent: 20,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
             ],
@@ -1759,18 +2473,20 @@ mod tests {
         use std::time::Duration;
 
         let mut splits = Splits::create(
-            PathBuf::from("fake/path"),
+            tempdir().unwrap().path().join("splits.json"),
             vec![
                 Split {
                     name: "Split 1".into(),
                     percent: 10,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
                 Split {
                     name: "Split 2".into(),
                     percent: 20,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
             ],
@@ -1820,18 +2536,20 @@ mod tests {
         use std::time::Duration;
 
         let mut splits = Splits::create(
-            PathBuf::from("fake/path"),
+            tempdir().unwrap().path().join("splits.json"),
             vec![
                 Split {
                     name: "Split 1".into(),
                     percent: 10,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
                 Split {
                     name: "Split 2".into(),
                     percent: 20,
                     time: None,
+                    best_segment: None,
                     history: vec![],
                 },
             ],
