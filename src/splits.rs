@@ -32,6 +32,7 @@ impl SplitsDisplay {
         window_size: usize,
     ) -> Vec<String> {
         // --- 1. Detect run start & snapshot PBs and best segments ---
+        // TODO: I believe this doesn't work with the first split => initialize also when creating SplitsDisplay?
         if let Some(active_run) = splits.active_run() {
             if Some(active_run.id) != self.last_run_id {
                 self.last_run_id = Some(active_run.id);
@@ -119,11 +120,19 @@ impl SplitsDisplay {
             // Format delta
             let delta_fmt = match delta {
                 Some(d) if gold => {
-                    format!("-{:02}:{:02}", (-d) / 60, (-d) % 60).color(Color::TrueColor {
-                        r: 255,
-                        g: 227,
-                        b: 0,
-                    })
+                    if d >= 0 {
+                        format!("+{:02}:{:02}", d / 60, d % 60).color(Color::TrueColor {
+                            r: 255,
+                            g: 227,
+                            b: 0,
+                        })
+                    } else {
+                        format!("-{:02}:{:02}", (-d) / 60, (-d) % 60).color(Color::TrueColor {
+                            r: 255,
+                            g: 227,
+                            b: 0,
+                        })
+                    }
                 }
                 Some(d) if d >= 0 => format!("+{:02}:{:02}", d / 60, d % 60).red(),
                 Some(d) if d < 0 => format!("-{:02}:{:02}", (-d) / 60, (-d) % 60).green(),

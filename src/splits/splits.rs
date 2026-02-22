@@ -48,6 +48,7 @@ pub struct Split {
 pub struct Splits {
     path: Option<PathBuf>,
     active_run: Option<ActiveRun>,
+    segmented: bool,
     personal_best: Option<RunSummary>,
     runs: Vec<RunSummary>,
     splits: Vec<Split>,
@@ -59,6 +60,7 @@ impl Splits {
         Splits {
             path: None,
             active_run: None,
+            segmented: false,
             personal_best: None,
             runs: Vec::new(),
             splits: Vec::new(),
@@ -70,6 +72,7 @@ impl Splits {
         let mut splits = Splits {
             path: Some(path),
             active_run: None,
+            segmented: false,
             personal_best: None,
             runs: Vec::new(),
             splits,
@@ -85,9 +88,21 @@ impl Splits {
         runs: Vec<RunSummary>,
         splits: Vec<Split>,
     ) -> anyhow::Result<Self> {
+        Splits::create_segmented_with_history(path, false, personal_best, runs, splits)
+    }
+
+    /// Currently only used for tests and deserialization
+    pub fn create_segmented_with_history(
+        path: PathBuf,
+        segmented: bool,
+        personal_best: Option<RunSummary>,
+        runs: Vec<RunSummary>,
+        splits: Vec<Split>,
+    ) -> anyhow::Result<Self> {
         let mut splits = Splits {
             path: Some(path),
             active_run: None,
+            segmented: segmented,
             personal_best,
             runs,
             splits,
@@ -102,6 +117,10 @@ impl Splits {
 
     pub fn active_run(&self) -> Option<&ActiveRun> {
         self.active_run.as_ref()
+    }
+
+    pub fn segmented(&self) -> bool {
+        self.segmented
     }
 
     // This is a hack, might be one more argument for proper LiveSplit integration

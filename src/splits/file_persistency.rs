@@ -105,6 +105,8 @@ struct SplitsFileV2 {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct SplitsV2 {
+    #[serde(default)]
+    pub segmented: bool,
     pub personal_best: Option<RunSummaryV2>,
     pub runs: Vec<RunSummaryV2>,
     pub splits: Vec<SplitV2>,
@@ -113,6 +115,7 @@ struct SplitsV2 {
 impl From<SplitsV1> for SplitsV2 {
     fn from(v1: SplitsV1) -> Self {
         let mut splits = SplitsV2 {
+            segmented: false,
             personal_best: None,
             runs: Vec::new(),
             splits: v1.splits.into_iter().map(|split| split.into()).collect(),
@@ -257,6 +260,7 @@ impl From<&Splits> for SplitsFileV2 {
         SplitsFileV2 {
             version: SPLITS_FILE_VERSION_V2,
             splits: SplitsV2 {
+                segmented: splits.segmented(),
                 personal_best: splits.personal_best().map(|pb| pb.into()),
                 runs: splits.runs().iter().map(|run| run.into()).collect(),
                 splits: splits.splits().iter().map(|split| split.into()).collect(),
@@ -274,8 +278,9 @@ fn from_v2(file_v2: SplitsFileV2, path: &Path) -> anyhow::Result<Splits> {
         .iter()
         .map(|split| split.into())
         .collect();
-    Ok(Splits::create_with_history(
+    Ok(Splits::create_segmented_with_history(
         path.to_path_buf(),
+        file_v2.splits.segmented,
         personal_best,
         runs,
         splits,
@@ -675,6 +680,8 @@ mod tests {
 
         let splits = load_from_file(&file_path)?;
 
+        assert_eq!(splits.segmented(), false);
+
         assert_eq!(splits.splits().len(), 2);
 
         let split1 = &splits.splits()[0];
@@ -787,8 +794,9 @@ mod tests {
             end_time: Some(chrono::Utc::now() + chrono::Duration::seconds(2400)),
             final_time: Some(Duration::from_secs(1750)),
         };
-        let original_splits = Splits::create_with_history(
+        let original_splits = Splits::create_segmented_with_history(
             file_path.clone(),
+            true,
             Some(pb.clone()),
             vec![pb.clone()],
             vec![
@@ -823,6 +831,8 @@ mod tests {
         let loaded_splits = load_from_file(&file_path)?;
 
         // Assert splits match
+        assert_eq!(loaded_splits.segmented(), true);
+
         assert_eq!(loaded_splits.splits().len(), original_splits.splits().len());
         for (orig, loaded) in original_splits
             .splits()
